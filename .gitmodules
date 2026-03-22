@@ -1,0 +1,6 @@
+[submodule "part"]
+	path = part
+	url = https://github.com/Its-OP/particle_transformer_lowpt_tau.git
+[submodule "weaver"]
+	path = weaver
+	url = https://github.com/Its-OP/weaver-core-low-pt.git
