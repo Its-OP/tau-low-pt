@@ -456,6 +456,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--save-every', type=int, default=5)
     parser.add_argument('--keep-best-k', type=int, default=5)
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Global seed for Python, NumPy, PyTorch (CPU + CUDA). '
+             'If unset, RNG stays non-deterministic (legacy behavior).',
+    )
     # CoupleReranker architecture knobs
     parser.add_argument('--couple-hidden-dim', type=int, default=256)
     parser.add_argument('--couple-num-residual-blocks', type=int, default=4)
@@ -496,6 +501,19 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
     device = torch.device(args.device)
+
+    # Global seed seeding. Covers Python `random`, NumPy, PyTorch CPU and
+    # CUDA RNGs so that negative sampling in `CoupleReranker.compute_loss`
+    # (uses `torch.randint`) and dataset shuffling are reproducible across
+    # runs. When `--seed` is unset the RNGs stay at their default
+    # non-deterministic initialization.
+    if args.seed is not None:
+        import random as _random
+        import numpy as _numpy
+        _random.seed(args.seed)
+        _numpy.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # The selection criterion (best-checkpoint metric) is C@100_couples,
     # so K=100 must be present. Catch typos before any work happens.

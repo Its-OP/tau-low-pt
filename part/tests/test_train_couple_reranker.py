@@ -114,6 +114,28 @@ class TestCliFlagPlumbing:
         assert args.k_values_couples == [50, 60, 70, 80, 90, 100]
         assert args.k_values_tracks == [30, 50, 100, 150]
 
+    def test_seed_default_none(self):
+        """`--seed` omitted keeps the RNG non-deterministic (legacy)."""
+        from train_couple_reranker import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args([
+            '--data-config', 'x', '--data-dir', 'x',
+            '--network', 'x', '--cascade-checkpoint', 'x',
+        ])
+        assert args.seed is None
+
+    def test_seed_int(self):
+        """`--seed 42` sets the global deterministic seed used by the
+        trainer's main() to seed Python, NumPy, and PyTorch RNGs."""
+        from train_couple_reranker import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args([
+            '--data-config', 'x', '--data-dir', 'x',
+            '--network', 'x', '--cascade-checkpoint', 'x',
+            '--seed', '42',
+        ])
+        assert args.seed == 42
+
 
 class TestCoupleCascadeKValuesTracksPropagation:
     """Regression: the trainer's k_values_tracks must reach the cascade
