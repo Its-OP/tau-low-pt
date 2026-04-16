@@ -533,6 +533,17 @@ def _build_parser() -> argparse.ArgumentParser:
             'of training and saved as best_model_ema_calibrated.pt.'
         ),
     )
+    parser.add_argument(
+        '--bn-calibration-steps',
+        type=int,
+        default=200,
+        help=(
+            'Number of forward-only training batches used to rebuild '
+            'the couple reranker BN running stats after training. 0 '
+            'disables the calibration step entirely (useful for smoke '
+            'tests).'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -957,13 +968,21 @@ def main():
 
     # ---- Post-training BN calibration ----
     # Rebuild clean running stats so eval() mode works correctly.
-    logger.info('Calibrating CoupleReranker BN running stats...')
-    calibrate_reranker_batchnorm(
-        model, train_loader, device, data_config,
-        mask_input_index, label_input_index,
-        calibration_steps=200,
-    )
-    if check_batchnorm_health(model):
+    if args.bn_calibration_steps <= 0:
+        logger.info(
+            'BN calibration skipped (--bn-calibration-steps=0).',
+        )
+    else:
+        logger.info(
+            'Calibrating CoupleReranker BN running stats '
+            f'({args.bn_calibration_steps} steps)...',
+        )
+        calibrate_reranker_batchnorm(
+            model, train_loader, device, data_config,
+            mask_input_index, label_input_index,
+            calibration_steps=args.bn_calibration_steps,
+        )
+    if args.bn_calibration_steps > 0 and check_batchnorm_health(model):
         logger.info('BN calibration complete — all running stats are finite')
         # Save a final checkpoint with clean BN stats
         calibrated_checkpoint = {
@@ -983,12 +1002,12 @@ def main():
         )
         torch.save(calibrated_checkpoint, calibrated_path)
         logger.info(f'Saved calibrated checkpoint: {calibrated_path}')
-    else:
+    elif args.bn_calibration_steps > 0:
         logger.error('BN calibration failed — NaN in running stats!')
 
     # ---- EMA (T2.3): swap in EMA weights, recalibrate BN on the EMA
     # copy, validate, save separately. The live model is unaffected.
-    if ema_model is not None:
+    if ema_model is not None and args.bn_calibration_steps > 0:
         logger.info('Swapping in EMA weights for BN recalibration + eval')
         original_reranker_state = {
             key: value.clone()
@@ -1002,7 +1021,7 @@ def main():
         calibrate_reranker_batchnorm(
             model, train_loader, device, data_config,
             mask_input_index, label_input_index,
-            calibration_steps=200,
+            calibration_steps=args.bn_calibration_steps,
         )
         if check_batchnorm_health(model):
             ema_val_losses, ema_val_metrics = validate(
