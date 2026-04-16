@@ -4,3 +4,9 @@
 
 # Large model checkpoints (exceeds GitHub 100MB limit)
 part/models/cascade_best.pt
+
+# Only part/ and weaver/ go to remote. Everything else at repo root is excluded.
+/*
+!/.gitignore
+!/part/
+!/weaver/
