@@ -91,7 +91,12 @@ if [ "${SMOKE_MODE}" = "1" ]; then
     EPOCHS="${EPOCHS:-1}"
     STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-3}"
     BATCH_SIZE="${BATCH_SIZE:-16}"
-    NUM_WORKERS="${NUM_WORKERS:-0}"
+    # Smoke uses --no-in-memory + a couple of workers so we skip the
+    # ~160 s in-memory preload of 10 train + 7 val parquets. With just
+    # 3 steps of 16 events we touch a tiny slice of the dataset;
+    # streaming is cheaper than preload.
+    NUM_WORKERS="${NUM_WORKERS:-2}"
+    NO_IN_MEMORY="${NO_IN_MEMORY:-1}"
     KEEP_BEST_K="${KEEP_BEST_K:-1}"
     BN_CALIBRATION_STEPS="${BN_CALIBRATION_STEPS:-0}"
     SWEEP_ROOT_PREFIX="couple_improvements_smoke"
@@ -100,6 +105,7 @@ else
     STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
     BATCH_SIZE="${BATCH_SIZE:-96}"
     NUM_WORKERS="${NUM_WORKERS:-10}"
+    NO_IN_MEMORY="${NO_IN_MEMORY:-0}"
     KEEP_BEST_K="${KEEP_BEST_K:-3}"
     BN_CALIBRATION_STEPS="${BN_CALIBRATION_STEPS:-200}"
     SWEEP_ROOT_PREFIX="couple_improvements"
@@ -190,6 +196,11 @@ for entry in "${ALL_EXPERIMENTS[@]}"; do
     echo "  Flags:    ${EXTRA_FLAGS:-<baseline>}"
     echo "----------------------------------------------------------------"
 
+    NO_IN_MEMORY_FLAG=""
+    if [ "${NO_IN_MEMORY}" = "1" ]; then
+        NO_IN_MEMORY_FLAG="--no-in-memory"
+    fi
+
     set +e
     # shellcheck disable=SC2086
     python train_couple_reranker.py \
@@ -211,6 +222,7 @@ for entry in "${ALL_EXPERIMENTS[@]}"; do
         --keep-best-k "${KEEP_BEST_K}" \
         --bn-calibration-steps "${BN_CALIBRATION_STEPS}" \
         --device "${DEVICE}" \
+        ${NO_IN_MEMORY_FLAG} \
         ${EXTRA_FLAGS} \
         2>&1 | tee "${EXP_LOG}"
     STATUS=${PIPESTATUS[0]}
