@@ -488,6 +488,27 @@ def _build_parser() -> argparse.ArgumentParser:
             '0.0 = plain cross-entropy. Typical: 0.05-0.10.'
         ),
     )
+    parser.add_argument(
+        '--couple-hardneg-fraction',
+        type=float,
+        default=0.0,
+        help=(
+            'Fraction of negatives drawn from the current top-scoring '
+            'pool per event (ANCE / NV-Retriever online hard-negative '
+            'mining). 0 = all random (legacy). Typical: 0.5.'
+        ),
+    )
+    parser.add_argument(
+        '--couple-hardneg-margin',
+        type=float,
+        default=0.1,
+        help=(
+            'Positive-aware threshold for hard-negative filtering. A '
+            "candidate is kept only if its score is < s_pos − margin, "
+            'which prevents false negatives from being selected as hard '
+            'negatives.'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -675,6 +696,8 @@ def main():
         couple_ranking_temperature=args.couple_ranking_temperature,
         couple_loss=args.couple_loss,
         couple_label_smoothing=args.couple_label_smoothing,
+        couple_hardneg_fraction=args.couple_hardneg_fraction,
+        couple_hardneg_margin=args.couple_hardneg_margin,
     )
     model = model.to(device)
 

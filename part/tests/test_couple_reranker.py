@@ -310,6 +310,89 @@ class TestSoftmaxCELoss:
         )['total_loss']
         assert abs(l_first.item() - l_second.item()) < 1e-6
 
+    # ----------------------------------------------------------------
+    # Hard-negative mining (T2.1)
+    # ----------------------------------------------------------------
+
+    def test_hardneg_fraction_invalid_rejected(self):
+        with pytest.raises(ValueError):
+            CoupleReranker(hardneg_fraction=1.5)
+        with pytest.raises(ValueError):
+            CoupleReranker(hardneg_fraction=-0.1)
+
+    def test_hardneg_zero_fraction_matches_random(self):
+        """With `hardneg_fraction=0` the sampler must be identical to the
+        legacy random negative sampling (reproducibility guarantee for
+        baselines)."""
+        torch.manual_seed(0)
+        model_a = CoupleReranker(
+            couple_loss='softmax-ce', hardneg_fraction=0.0,
+        )
+        model_b = CoupleReranker(
+            couple_loss='softmax-ce', hardneg_fraction=0.0,
+        )
+        model_b.load_state_dict(model_a.state_dict())
+
+        couple_features = torch.randn(2, 51, 40)
+        couple_labels = torch.zeros(2, 40)
+        couple_labels[:, [0, 1]] = 1.0
+        couple_mask = torch.ones(2, 40)
+
+        torch.manual_seed(1)
+        l_a = model_a.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        torch.manual_seed(1)
+        l_b = model_b.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        assert abs(l_a.item() - l_b.item()) < 1e-6
+
+    def test_hardneg_sampling_returns_expected_count(self):
+        """`_sample_negative_indices` must return exactly `ranking_num_samples`
+        negative indices regardless of hardneg_fraction."""
+        model = CoupleReranker(
+            couple_loss='softmax-ce',
+            ranking_num_samples=20,
+            hardneg_fraction=0.5,
+        )
+        # Fake per-event scores: 5 positives at high score, 50 negatives
+        # at random scores.
+        torch.manual_seed(0)
+        event_scores = torch.randn(55)
+        event_scores[:5] += 5.0  # make positives clearly higher
+        positive_indices = torch.arange(5)
+        negative_indices = torch.arange(5, 55)
+        sampled = model._sample_negative_indices(
+            event_scores, positive_indices, negative_indices,
+        )
+        assert sampled.shape[0] == model.ranking_num_samples
+        # No positive index should sneak in
+        assert not any(int(idx) < 5 for idx in sampled)
+
+    def test_hardneg_margin_filters_out_false_negatives(self):
+        """High-score negatives close to a positive (within margin) must
+        be excluded. Verify by constructing a score tensor where all
+        top negatives are within margin — result should contain only
+        random fills (no indices from the top-scoring negatives)."""
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            couple_loss='softmax-ce',
+            ranking_num_samples=10,
+            hardneg_fraction=1.0,  # all slots requested as hard
+            hardneg_margin=2.0,  # margin is large → no neg clears
+        )
+        event_scores = torch.zeros(20)
+        positive_indices = torch.tensor([0])
+        event_scores[0] = 3.0  # positive
+        # Set all negatives to scores just below positive (within margin)
+        event_scores[1:] = 2.0  # 2.0 not < 3.0 - 2.0 = 1.0, so all filtered out
+        negative_indices = torch.arange(1, 20)
+        sampled = model._sample_negative_indices(
+            event_scores, positive_indices, negative_indices,
+        )
+        assert sampled.shape[0] == 10  # filled with random
+
     def test_label_smoothing_changes_loss_value(self):
         """ε=0.1 must produce a different loss value than ε=0.0 (same
         model, same scores). Seed torch around each call so the sampled

@@ -134,6 +134,8 @@ def get_model(data_config, **kwargs):
     couple_ranking_temperature = kwargs.pop('couple_ranking_temperature', 1.0)
     couple_loss = kwargs.pop('couple_loss', 'pairwise')
     couple_label_smoothing = kwargs.pop('couple_label_smoothing', 0.0)
+    couple_hardneg_fraction = kwargs.pop('couple_hardneg_fraction', 0.0)
+    couple_hardneg_margin = kwargs.pop('couple_hardneg_margin', 0.1)
 
     # Pop unused args from other heads
     for unused_arg in [
@@ -178,6 +180,8 @@ def get_model(data_config, **kwargs):
         ranking_temperature=couple_ranking_temperature,
         couple_loss=couple_loss,
         label_smoothing=couple_label_smoothing,
+        hardneg_fraction=couple_hardneg_fraction,
+        hardneg_margin=couple_hardneg_margin,
     )
     couple_params = sum(p.numel() for p in couple_reranker.parameters())
     _logger.info(

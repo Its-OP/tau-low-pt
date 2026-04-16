@@ -128,12 +128,18 @@ class CoupleReranker(nn.Module):
         ranking_temperature: float = 1.0,
         couple_loss: str = 'pairwise',
         label_smoothing: float = 0.0,
+        hardneg_fraction: float = 0.0,
+        hardneg_margin: float = 0.1,
     ):
         super().__init__()
         if couple_loss not in ('pairwise', 'softmax-ce'):
             raise ValueError(
                 f"couple_loss must be 'pairwise' or 'softmax-ce', "
                 f"got '{couple_loss}'",
+            )
+        if not 0.0 <= hardneg_fraction <= 1.0:
+            raise ValueError(
+                f'hardneg_fraction must be in [0, 1], got {hardneg_fraction}',
             )
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -143,6 +149,8 @@ class CoupleReranker(nn.Module):
         self.ranking_temperature = ranking_temperature
         self.couple_loss = couple_loss
         self.label_smoothing = label_smoothing
+        self.hardneg_fraction = hardneg_fraction
+        self.hardneg_margin = hardneg_margin
 
         # Input projection: 51 → hidden_dim
         self.input_projection = nn.Sequential(
@@ -251,14 +259,9 @@ class CoupleReranker(nn.Module):
             if len(positive_indices) == 0 or len(negative_indices) == 0:
                 continue
 
-            num_samples = min(
-                self.ranking_num_samples, len(negative_indices),
+            sampled_negatives = self._sample_negative_indices(
+                event_scores, positive_indices, negative_indices,
             )
-            sample_indices = torch.randint(
-                0, len(negative_indices), (num_samples,),
-                device=scores.device,
-            )
-            sampled_negatives = negative_indices[sample_indices]
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
@@ -270,6 +273,73 @@ class CoupleReranker(nn.Module):
         if not event_losses:
             return scores.sum() * 0.0
         return torch.stack(event_losses).mean()
+
+    def _sample_negative_indices(
+        self,
+        event_scores: torch.Tensor,
+        positive_indices: torch.Tensor,
+        negative_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample ``ranking_num_samples`` negative couple indices.
+
+        When ``hardneg_fraction == 0`` the sample is fully random (legacy
+        behavior). When > 0, the first ``⌈N · frac⌉`` slots are filled
+        from the top-scoring negatives that pass a positive-aware margin
+        filter (``score < max(pos_scores) − margin``); this is the ANCE /
+        NV-Retriever recipe and prevents false negatives from being
+        selected as hard negatives. The remaining slots are filled with
+        random negatives to preserve gradient diversity.
+
+        Math:
+            N     = min(ranking_num_samples, |negs|)
+            M     = min(⌈N · hardneg_fraction⌉, |negs|)
+            pool  = top-M negatives by score, filtered by
+                    score < max(s_pos) − hardneg_margin
+            fill  = N − |pool| random negatives
+            out   = concat(pool, fill)
+        """
+        num_samples = min(self.ranking_num_samples, len(negative_indices))
+        if self.hardneg_fraction <= 0.0:
+            sample_indices = torch.randint(
+                0, len(negative_indices), (num_samples,),
+                device=event_scores.device,
+            )
+            return negative_indices[sample_indices]
+
+        hardneg_count = min(
+            int(round(num_samples * self.hardneg_fraction)),
+            len(negative_indices),
+        )
+        if hardneg_count > 0:
+            with torch.no_grad():
+                negative_scores_detached = event_scores[
+                    negative_indices
+                ].detach()
+                top_values, top_positions = torch.topk(
+                    negative_scores_detached,
+                    k=min(hardneg_count, len(negative_indices)),
+                )
+                threshold = (
+                    event_scores[positive_indices].detach().max()
+                    - self.hardneg_margin
+                )
+                keep_mask = top_values < threshold
+                hard_positions = top_positions[keep_mask]
+            hard_negatives = negative_indices[hard_positions]
+        else:
+            hard_negatives = negative_indices.new_empty((0,))
+
+        remaining = num_samples - len(hard_negatives)
+        if remaining > 0:
+            random_positions = torch.randint(
+                0, len(negative_indices), (remaining,),
+                device=event_scores.device,
+            )
+            random_negatives = negative_indices[random_positions]
+            sampled = torch.cat([hard_negatives, random_negatives], dim=0)
+        else:
+            sampled = hard_negatives[:num_samples]
+        return sampled
 
     def _softmax_ce_loss(
         self,
@@ -310,14 +380,9 @@ class CoupleReranker(nn.Module):
             if len(positive_indices) == 0 or len(negative_indices) == 0:
                 continue
 
-            num_samples = min(
-                self.ranking_num_samples, len(negative_indices),
+            sampled_negatives = self._sample_negative_indices(
+                event_scores, positive_indices, negative_indices,
             )
-            sample_indices = torch.randint(
-                0, len(negative_indices), (num_samples,),
-                device=scores.device,
-            )
-            sampled_negatives = negative_indices[sample_indices]
             negative_scores = event_scores[sampled_negatives]
 
             positive_losses: list[torch.Tensor] = []
