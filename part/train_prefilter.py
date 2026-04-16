@@ -106,6 +106,7 @@ def train_one_epoch(
     mask_input_index: int,
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
+    augmentation: torch.nn.Module | None = None,
 ) -> tuple[dict[str, float], int]:
     """Train for one epoch."""
     model.train()
@@ -134,6 +135,12 @@ def train_one_epoch(
             inputs, label_input_index,
         )
         points, features, lorentz_vectors, mask = model_inputs
+
+        # Optional set-friendly augmentation (JetCLR-style).
+        if augmentation is not None:
+            points, features, lorentz_vectors, mask = augmentation(
+                points, features, lorentz_vectors, mask, track_labels,
+            )
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -550,6 +557,14 @@ def main():
         logit_adjust_tau=args.logit_adjust_tau,
         listwise_temperature=args.listwise_temperature,
     )
+
+    # Optional set-friendly training augmentation. Eval/val path is
+    # untouched — augmentation only fires in train mode.
+    if args.use_augmentation:
+        from utils.set_augmentation import SetAugmentation
+        augmentation = SetAugmentation().to(device)
+    else:
+        augmentation = None
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -709,6 +724,7 @@ def main():
                 tensorboard_writer, global_batch_count,
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
+                augmentation=augmentation,
             )
 
             eval_steps = max(1, steps_per_epoch // 4)
