@@ -290,28 +290,36 @@ class TestSoftmaxCELoss:
         )
 
     def test_label_smoothing_reduces_to_plain_at_zero(self):
-        torch.manual_seed(0)
-        model_plain = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
-        model_smoothed = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
-        model_smoothed.load_state_dict(model_plain.state_dict())
-
+        """Two softmax-CE forwards with ε=0 must return the same loss when
+        the sampled negatives are the same (seed torch before each call)."""
+        model = CoupleReranker(
+            couple_loss='softmax-ce', label_smoothing=0.0,
+        )
         couple_features = torch.randn(2, 51, 40)
         couple_labels = torch.zeros(2, 40)
         couple_labels[:, [0, 1]] = 1.0
         couple_mask = torch.ones(2, 40)
 
-        l_plain = model_plain.compute_loss(
+        torch.manual_seed(0)
+        l_first = model.compute_loss(
             couple_features, couple_labels, couple_mask,
         )['total_loss']
-        l_smoothed = model_smoothed.compute_loss(
+        torch.manual_seed(0)
+        l_second = model.compute_loss(
             couple_features, couple_labels, couple_mask,
         )['total_loss']
-        assert abs(l_plain.item() - l_smoothed.item()) < 1e-6
+        assert abs(l_first.item() - l_second.item()) < 1e-6
 
     def test_label_smoothing_changes_loss_value(self):
-        torch.manual_seed(0)
-        model_a = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
-        model_b = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.1)
+        """ε=0.1 must produce a different loss value than ε=0.0 (same
+        model, same scores). Seed torch around each call so the sampled
+        negatives are identical between the two forward passes."""
+        model_a = CoupleReranker(
+            couple_loss='softmax-ce', label_smoothing=0.0,
+        )
+        model_b = CoupleReranker(
+            couple_loss='softmax-ce', label_smoothing=0.1,
+        )
         model_b.load_state_dict(model_a.state_dict())
 
         couple_features = torch.randn(2, 51, 40)
@@ -319,9 +327,11 @@ class TestSoftmaxCELoss:
         couple_labels[:, [0, 1]] = 1.0
         couple_mask = torch.ones(2, 40)
 
+        torch.manual_seed(0)
         l_a = model_a.compute_loss(
             couple_features, couple_labels, couple_mask,
         )['total_loss']
+        torch.manual_seed(0)
         l_b = model_b.compute_loss(
             couple_features, couple_labels, couple_mask,
         )['total_loss']
