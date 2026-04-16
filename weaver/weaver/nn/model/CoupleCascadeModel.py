@@ -37,6 +37,7 @@ class CoupleCascadeModel(nn.Module):
         couple_reranker: nn.Module,
         top_k2: int = 50,
         k_values_tracks: tuple[int, ...] = (30, 50, 75, 100, 200),
+        pair_kinematics_v2: bool = False,
     ):
         super().__init__()
         self.cascade = cascade
@@ -47,6 +48,10 @@ class CoupleCascadeModel(nn.Module):
         # prefix of the Stage 2 score ranking. Stored as a buffer so
         # the values stick with the saved checkpoint.
         self.k_values_tracks = tuple(k_values_tracks)
+        # T2.2: when True, `build_couple_features_batched` emits 55 dims
+        # (51 + 4 extra pair-kinematic features). The reranker's
+        # `input_dim` must match.
+        self.pair_kinematics_v2 = pair_kinematics_v2
 
         # Freeze the entire cascade (Stage 1 + Stage 2). The optimizer
         # will pick up only `couple_reranker.parameters()` because we
@@ -186,6 +191,7 @@ class CoupleCascadeModel(nn.Module):
             top_k2_stage2_scores=top_k2_data['stage2_scores'],
             top_k2_track_labels=top_k2_data['track_labels'],
             track_valid_mask=top_k2_data['track_valid_mask'],
+            pair_kinematics_v2=self.pair_kinematics_v2,
         )
         couple_inputs['n_gt_in_top_k1'] = top_k2_data['n_gt_in_top_k1']
         couple_inputs['n_gt_in_top_k_tracks'] = top_k2_data['n_gt_in_top_k_tracks']

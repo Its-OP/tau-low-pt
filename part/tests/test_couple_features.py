@@ -684,3 +684,98 @@ class TestBuildCoupleFeaturesBatched:
             result_mask['couple_features'], result_no_mask['couple_features'], atol=1e-6,
         )
         assert torch.equal(result_mask['filter_a_mask'], result_no_mask['filter_a_mask'])
+
+
+class TestPairKinematicsV2:
+    """Extra four pair-kinematic features (T2.2)."""
+
+    def _make_batch(self, batch_size=2):
+        events = [_make_synthetic_event(seed=i) for i in range(batch_size)]
+        return {
+            'features': torch.stack([e['features'] for e in events]),
+            'points': torch.stack([e['points'] for e in events]),
+            'lorentz': torch.stack([e['lorentz'] for e in events]),
+            'stage1_scores': torch.stack([e['stage1_scores'] for e in events]),
+            'stage2_scores': torch.stack([e['stage2_scores'] for e in events]),
+            'track_labels': torch.stack([e['track_labels'] for e in events]),
+        }
+
+    def test_v2_output_has_55_dims(self):
+        from utils.couple_features import COUPLE_FEATURE_DIM_V2
+        assert COUPLE_FEATURE_DIM_V2 == 55
+        batch = self._make_batch(batch_size=2)
+        result = build_couple_features_batched(
+            top_k2_features=batch['features'],
+            top_k2_points=batch['points'],
+            top_k2_lorentz=batch['lorentz'],
+            top_k2_stage1_scores=batch['stage1_scores'],
+            top_k2_stage2_scores=batch['stage2_scores'],
+            top_k2_track_labels=batch['track_labels'],
+            pair_kinematics_v2=True,
+        )
+        n_couples = NUM_TRACKS * (NUM_TRACKS - 1) // 2
+        assert result['couple_features'].shape == (2, 55, n_couples)
+
+    def test_v2_first_51_channels_identical_to_v1(self):
+        """With `pair_kinematics_v2=True` the first 51 channels of the
+        output must bytewise match the v1 output (extras go at the end)."""
+        batch = self._make_batch(batch_size=2)
+        kwargs = {
+            'top_k2_features': batch['features'],
+            'top_k2_points': batch['points'],
+            'top_k2_lorentz': batch['lorentz'],
+            'top_k2_stage1_scores': batch['stage1_scores'],
+            'top_k2_stage2_scores': batch['stage2_scores'],
+            'top_k2_track_labels': batch['track_labels'],
+        }
+        v1 = build_couple_features_batched(**kwargs)
+        v2 = build_couple_features_batched(pair_kinematics_v2=True, **kwargs)
+        assert torch.allclose(
+            v1['couple_features'],
+            v2['couple_features'][:, :51, :],
+            atol=1e-6,
+        )
+
+    def test_v2_cos_opening_angle_in_expected_range(self):
+        """Channel 51 = cos(opening angle) ∈ [-1, 1]."""
+        batch = self._make_batch(batch_size=2)
+        result = build_couple_features_batched(
+            top_k2_features=batch['features'],
+            top_k2_points=batch['points'],
+            top_k2_lorentz=batch['lorentz'],
+            top_k2_stage1_scores=batch['stage1_scores'],
+            top_k2_stage2_scores=batch['stage2_scores'],
+            pair_kinematics_v2=True,
+        )
+        cos_angle = result['couple_features'][:, 51, :]
+        assert (cos_angle >= -1.0001).all()
+        assert (cos_angle <= 1.0001).all()
+
+    def test_v2_mass_residual_sign_makes_sense(self):
+        """Channel 52 = (m − m_τ) / σ_m: negative below τ mass, positive
+        above. Synthetic pions are low-pT so most couples are below τ."""
+        batch = self._make_batch(batch_size=4)
+        result = build_couple_features_batched(
+            top_k2_features=batch['features'],
+            top_k2_points=batch['points'],
+            top_k2_lorentz=batch['lorentz'],
+            top_k2_stage1_scores=batch['stage1_scores'],
+            top_k2_stage2_scores=batch['stage2_scores'],
+            pair_kinematics_v2=True,
+        )
+        mass_residual = result['couple_features'][:, 52, :]
+        # Synthetic low-pT batch → below-tau couples dominate
+        assert (mass_residual < 0).sum() > (mass_residual > 0).sum()
+
+    def test_v2_is_opt_in_default_stays_51(self):
+        """Default `pair_kinematics_v2=False` must still emit 51 dims
+        (backwards compat for pretrained reranker checkpoints)."""
+        batch = self._make_batch(batch_size=2)
+        result = build_couple_features_batched(
+            top_k2_features=batch['features'],
+            top_k2_points=batch['points'],
+            top_k2_lorentz=batch['lorentz'],
+            top_k2_stage1_scores=batch['stage1_scores'],
+            top_k2_stage2_scores=batch['stage2_scores'],
+        )
+        assert result['couple_features'].shape[1] == 51

@@ -509,6 +509,16 @@ def _build_parser() -> argparse.ArgumentParser:
             'negatives.'
         ),
     )
+    parser.add_argument(
+        '--pair-kinematics-v2',
+        action='store_true',
+        help=(
+            'Append four extra per-couple features to the 51-dim feature '
+            'block: cos(opening angle), (m_ij − m_τ)/σ_m, '
+            'dxy_sig_i·dxy_sig_j, dz_sig_i·dz_sig_j. Bumps reranker '
+            'input_dim to 55.'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -698,6 +708,7 @@ def main():
         couple_label_smoothing=args.couple_label_smoothing,
         couple_hardneg_fraction=args.couple_hardneg_fraction,
         couple_hardneg_margin=args.couple_hardneg_margin,
+        pair_kinematics_v2=args.pair_kinematics_v2,
     )
     model = model.to(device)
 

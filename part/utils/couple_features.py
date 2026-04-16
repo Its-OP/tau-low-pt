@@ -39,6 +39,24 @@ CASCADE_SCORE_DIM = 4
 COUPLE_FEATURE_DIM = 16 * 2 + PAIRWISE_PHYSICS_DIM + DERIVED_GEOM_DIM + CASCADE_SCORE_DIM
 assert COUPLE_FEATURE_DIM == 51
 
+# T2.2: pair-kinematics v2 adds 4 extra per-couple features that are
+# standard in CMS/ATLAS tau / jet-tagging rerankers:
+#   1. cos(θ_3D)   — opening angle from the 3D momenta
+#   2. (m(ij) − m_τ) / σ_m — normalized mass residual, σ_m set to
+#      ~0.1 GeV (order-of-magnitude tau mass resolution in CMS low-pT).
+#   3. dxy_sig_i · dxy_sig_j — product of 2D impact-parameter
+#      significances (concordance of displacement direction; distinct
+#      signal from `|Δdxy|`).
+#   4. dz_sig_i · dz_sig_j — product of 3D longitudinal impact-parameter
+#      significances.
+PAIR_KINEMATICS_V2_EXTRA_DIM = 4
+COUPLE_FEATURE_DIM_V2 = COUPLE_FEATURE_DIM + PAIR_KINEMATICS_V2_EXTRA_DIM
+assert COUPLE_FEATURE_DIM_V2 == 55
+
+# Scale for the mass residual; matches the ρ(770) σ by default so the
+# residual stays O(1) and doesn't require per-run retuning.
+TAU_MASS_SIGMA_GEV = 0.1
+
 # ρ(770) Gaussian indicator parameters (matches CascadeReranker._compute_extra_pairwise_features)
 RHO_MASS_GEV = 0.770
 RHO_SIGMA_GEV = 0.075
@@ -316,6 +334,7 @@ def build_couple_features_batched(
     top_k2_track_labels: torch.Tensor | None = None,
     track_valid_mask: torch.Tensor | None = None,
     m_tau: float = M_TAU_GEV,
+    pair_kinematics_v2: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Vectorized batched version of the per-event feature builder.
 
@@ -484,11 +503,49 @@ def build_couple_features_batched(
     cascade_scores = torch.stack([s1_i, s2_i, s1_j, s2_j], dim=1)
 
     # ---- Concat all 51 dims ----
-    couple_features = torch.cat(
-        [feat_i, feat_j, pairwise_physics, derived_geometric, cascade_scores],
-        dim=1,
-    )
-    assert couple_features.shape[1] == COUPLE_FEATURE_DIM
+    couple_features_list = [
+        feat_i,
+        feat_j,
+        pairwise_physics,
+        derived_geometric,
+        cascade_scores,
+    ]
+
+    expected_dim = COUPLE_FEATURE_DIM
+    if pair_kinematics_v2:
+        # ---- Block 5 (T2.2 v2): 4 extra pair-kinematic features ----
+        p_mag_i = torch.sqrt(
+            px_i ** 2 + py_i ** 2 + pz_i ** 2 + 1e-10,
+        )
+        p_mag_j = torch.sqrt(
+            px_j ** 2 + py_j ** 2 + pz_j ** 2 + 1e-10,
+        )
+        # cos(θ_3D): 3D momentum dot / (|p_i| |p_j|)
+        cos_opening_angle = (
+            (px_i * px_j + py_i * py_j + pz_i * pz_j)
+            / (p_mag_i * p_mag_j)
+        )
+        # Normalized mass residual; small positive when the couple is
+        # near the τ mass, negative when below.
+        mass_residual_norm = (m_ij - m_tau) / TAU_MASS_SIGMA_GEV
+        # Impact-parameter concordance products (channels 6 = dxy_sig,
+        # 7 = log_dz_sig in standardized inputs).
+        dxy_sig_product = dxy_sig_i * dxy_sig_j
+        dz_sig_product = dz_sig_i * dz_sig_j
+        pair_v2_extras = torch.stack(
+            [
+                cos_opening_angle,
+                mass_residual_norm,
+                dxy_sig_product,
+                dz_sig_product,
+            ],
+            dim=1,
+        )
+        couple_features_list.append(pair_v2_extras)
+        expected_dim = COUPLE_FEATURE_DIM_V2
+
+    couple_features = torch.cat(couple_features_list, dim=1)
+    assert couple_features.shape[1] == expected_dim
 
     # Filter A: m(ij) <= m_tau (boolean mask, kept separate from features)
     # Couples involving padding tracks are excluded when track_valid_mask

@@ -136,6 +136,7 @@ def get_model(data_config, **kwargs):
     couple_label_smoothing = kwargs.pop('couple_label_smoothing', 0.0)
     couple_hardneg_fraction = kwargs.pop('couple_hardneg_fraction', 0.0)
     couple_hardneg_margin = kwargs.pop('couple_hardneg_margin', 0.1)
+    pair_kinematics_v2 = kwargs.pop('pair_kinematics_v2', False)
 
     # Pop unused args from other heads
     for unused_arg in [
@@ -170,9 +171,13 @@ def get_model(data_config, **kwargs):
     _logger.info(f'Frozen cascade: {cascade_params:,} params')
 
     # ---- Stage 3: CoupleReranker (trainable) ----
-    # input_dim is fixed at 51 (the COUPLE_FEATURE_DIM from couple_features.py)
+    # input_dim is 51 by default, 55 with `pair_kinematics_v2` (T2.2).
+    from utils.couple_features import COUPLE_FEATURE_DIM, COUPLE_FEATURE_DIM_V2
+    couple_input_dim = (
+        COUPLE_FEATURE_DIM_V2 if pair_kinematics_v2 else COUPLE_FEATURE_DIM
+    )
     couple_reranker = CoupleReranker(
-        input_dim=51,
+        input_dim=couple_input_dim,
         hidden_dim=couple_hidden_dim,
         num_residual_blocks=couple_num_residual_blocks,
         dropout=couple_dropout,
@@ -196,6 +201,7 @@ def get_model(data_config, **kwargs):
         couple_reranker=couple_reranker,
         top_k2=top_k2,
         k_values_tracks=k_values_tracks,
+        pair_kinematics_v2=pair_kinematics_v2,
     )
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(
