@@ -46,6 +46,8 @@ def get_model(data_config, **kwargs):
         loss_type=kwargs.pop('loss_type', 'pairwise'),
         logit_adjust_tau=kwargs.pop('logit_adjust_tau', 1.0),
         listwise_temperature=kwargs.pop('listwise_temperature', 1.0),
+        use_xgb_stub_feature=kwargs.pop('use_xgb_stub_feature', False),
+        clustering_dim=kwargs.pop('clustering_dim', 8),
         ranking_num_samples=50,
         # Dropout rate for the mlp-mode MLP hidden layers (track_mlp,
         # neighbor_mlps, scorer). 0.1 is the 2026-04-07 overfit-mitigation

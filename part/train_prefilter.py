@@ -107,6 +107,9 @@ def train_one_epoch(
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
     augmentation: torch.nn.Module | None = None,
+    ema_teacher: torch.nn.Module | None = None,
+    ema_decay: float = 0.999,
+    kl_weight: float = 0.1,
 ) -> tuple[dict[str, float], int]:
     """Train for one epoch."""
     model.train()
@@ -155,6 +158,41 @@ def train_one_epoch(
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
             )
+            student_scores = loss_dict.get('_scores')
+
+            # Self-distillation EMA teacher (E12). Teacher runs in eval
+            # mode and no-grad. KL between student and teacher logits
+            # (softened with temperature 1) is added with kl_weight.
+            if ema_teacher is not None and student_scores is not None:
+                with torch.no_grad():
+                    teacher_scores = ema_teacher(
+                        points, features, lorentz_vectors, mask,
+                    )
+                valid_mask = mask.squeeze(1).bool()
+                student_logits = student_scores.masked_fill(
+                    ~valid_mask, float('-inf'),
+                )
+                teacher_logits = teacher_scores.masked_fill(
+                    ~valid_mask, float('-inf'),
+                )
+                student_log_prob = torch.nn.functional.log_softmax(
+                    student_logits, dim=-1,
+                )
+                teacher_prob = torch.nn.functional.softmax(
+                    teacher_logits, dim=-1,
+                )
+                # Per-event KL, averaged over events with at least 1 positive.
+                kl_per_event = torch.nn.functional.kl_div(
+                    student_log_prob, teacher_prob,
+                    reduction='none',
+                )
+                kl_per_event = kl_per_event.sum(dim=-1)
+                kl_loss = kl_per_event.mean()
+                loss_dict['kl_loss'] = kl_loss
+                loss_dict['total_loss'] = loss_dict['total_loss'] + (
+                    kl_weight * kl_loss
+                )
+
             # Remove cached scores (non-scalar) before loss accumulation
             loss_dict.pop('_scores', None)
             loss = loss_dict['total_loss']
@@ -185,6 +223,25 @@ def train_one_epoch(
             grad_scaler.update()
         else:
             optimizer.step()
+
+        # EMA teacher update (E12). θ_teacher ← decay · θ_teacher + (1-decay) · θ_student.
+        if ema_teacher is not None:
+            with torch.no_grad():
+                student_params = dict(model.named_parameters())
+                for name, teacher_param in ema_teacher.named_parameters():
+                    student_param = student_params.get(name)
+                    if student_param is None:
+                        continue
+                    teacher_param.data.mul_(ema_decay).add_(
+                        student_param.data, alpha=1.0 - ema_decay,
+                    )
+                # Buffers (BN running stats) — copy straight through.
+                student_buffers = dict(model.named_buffers())
+                for name, teacher_buffer in ema_teacher.named_buffers():
+                    student_buffer = student_buffers.get(name)
+                    if student_buffer is None:
+                        continue
+                    teacher_buffer.data.copy_(student_buffer.data)
 
         scheduler.step_batch()
 
@@ -375,7 +432,7 @@ def main():
         '--loss-type', type=str, default='pairwise',
         choices=[
             'pairwise', 'listwise_ce', 'infonce',
-            'logit_adjust', 'object_condensation',
+            'logit_adjust', 'object_condensation', 'mpm_pretrain',
         ],
         help='Per-event supervision loss. Default pairwise matches '
              'the historical TrackPreFilter ranking objective.',
@@ -400,6 +457,58 @@ def main():
         help='Load backbone weights (track_mlp, neighbor_mlps) from a '
              'masked-particle-modeling SSL pretrain checkpoint before '
              'supervised training starts.',
+    )
+    parser.add_argument(
+        '--mpm-pretrain-epochs', type=int, default=0,
+        help='If > 0, run that many epochs of masked-particle-modeling '
+             'pretraining before the supervised phase. Uses the model'
+             "'s track_mlp + neighbor_mlps backbone and a reconstruction "
+             'head to predict the input features of randomly masked tracks.',
+    )
+    parser.add_argument(
+        '--mpm-mask-ratio', type=float, default=0.15,
+        help='Fraction of valid tracks randomly masked during MPM pretrain.',
+    )
+    # --- Self-distillation EMA teacher (E12) ---
+    parser.add_argument(
+        '--use-self-distillation', action='store_true',
+        help='Enable self-distillation: maintain an EMA teacher copy of '
+             'the student, add a KL-divergence loss between their logits.',
+    )
+    parser.add_argument(
+        '--ema-decay', type=float, default=0.999,
+        help='EMA decay for the teacher. Higher = slower teacher.',
+    )
+    parser.add_argument(
+        '--kl-weight', type=float, default=0.1,
+        help='Weight of the KL-divergence auxiliary loss.',
+    )
+    # --- Object condensation head (E5) ---
+    parser.add_argument(
+        '--clustering-dim', type=int, default=8,
+        help='Embedding dim for object-condensation loss (E5). '
+             'Unused unless --loss-type object_condensation.',
+    )
+    parser.add_argument(
+        '--oc-potential-weight', type=float, default=1.0,
+        help='Weight of the OC attractive/repulsive potential term.',
+    )
+    parser.add_argument(
+        '--oc-beta-weight', type=float, default=1.0,
+        help='Weight of the OC β-regulariser term.',
+    )
+    parser.add_argument(
+        '--oc-q-min', type=float, default=0.1,
+        help='Minimum charge floor for object-condensation q values.',
+    )
+    # --- XGBoost stub feature (E7) ---
+    parser.add_argument(
+        '--use-xgb-stub-feature', action='store_true',
+        help='Prepend a frozen linear per-track score (16→1) as a 17th '
+             'feature channel. Stub placeholder for the real XGBoost '
+             'score cache — once the cache exists, replace the stub '
+             'with the pre-computed scores. The flag exists so the '
+             'input-dim path is exercised.',
     )
     parser.add_argument('--train-fraction', type=float, default=0.8,
                         help='Fraction of data-dir for training (ignored if --val-data-dir set)')
@@ -556,7 +665,22 @@ def main():
         loss_type=args.loss_type,
         logit_adjust_tau=args.logit_adjust_tau,
         listwise_temperature=args.listwise_temperature,
+        use_xgb_stub_feature=args.use_xgb_stub_feature,
+        clustering_dim=args.clustering_dim,
     )
+    # Post-construction scalar attribute tweaks for the OC / MPM flags
+    # that don't change module layout.
+    if hasattr(model, 'module'):
+        model_root = model.module
+    else:
+        model_root = model
+    model_root.oc_q_min = args.oc_q_min
+    model_root.oc_potential_weight = args.oc_potential_weight
+    model_root.oc_beta_weight = args.oc_beta_weight
+    model_root.mpm_mask_ratio = args.mpm_mask_ratio
+    # MPM masking is ON whenever loss_type == 'mpm_pretrain' (combined
+    # with ``self.training`` gate inside _forward_mlp).
+    model_root.apply_mpm_masking = args.loss_type == 'mpm_pretrain'
 
     # Optional set-friendly training augmentation. Eval/val path is
     # untouched — augmentation only fires in train mode.
@@ -565,6 +689,29 @@ def main():
         augmentation = SetAugmentation().to(device)
     else:
         augmentation = None
+
+    # EMA teacher for self-distillation (E12). Constructed as a second
+    # network_module.get_model call using the same flags; state dict is
+    # copied from the student, gradients frozen, set to eval mode.
+    if args.use_self_distillation:
+        ema_teacher, _ = network_module.get_model(
+            data_config,
+            dropout=args.dropout,
+            num_neighbors=args.num_neighbors,
+            num_message_rounds=args.num_message_rounds,
+            aggregation_mode=args.aggregation_mode,
+            use_edge_features=args.use_edge_features,
+            loss_type=args.loss_type,
+            logit_adjust_tau=args.logit_adjust_tau,
+            listwise_temperature=args.listwise_temperature,
+        )
+        ema_teacher = ema_teacher.to(device)
+        ema_teacher.load_state_dict(model_root.state_dict())
+        for parameter in ema_teacher.parameters():
+            parameter.requires_grad = False
+        ema_teacher.eval()
+    else:
+        ema_teacher = None
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -725,6 +872,9 @@ def main():
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
                 augmentation=augmentation,
+                ema_teacher=ema_teacher,
+                ema_decay=args.ema_decay,
+                kl_weight=args.kl_weight,
             )
 
             eval_steps = max(1, steps_per_epoch // 4)

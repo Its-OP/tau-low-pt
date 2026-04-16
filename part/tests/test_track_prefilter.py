@@ -1219,3 +1219,57 @@ class TestEdgeFeatures:
         assert not torch.allclose(
             scores_baseline[valid], scores_edge[valid], atol=1e-5,
         )
+
+
+class TestDeferredExperiments:
+    """Smoke-level coverage for E5, E7, E10, E12 wiring."""
+
+    def test_xgb_stub_feature_path(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, use_xgb_stub_feature=True,
+        )
+        assert hasattr(model, 'xgb_stub')
+        assert hasattr(model, 'track_mlp_with_xgb')
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        scores = model(points, features, lorentz_vectors, mask)
+        assert scores.shape == (BATCH_SIZE, NUM_TRACKS)
+        assert torch.isfinite(
+            scores[mask.squeeze(1).bool()],
+        ).all()
+
+    def test_object_condensation_forward_and_loss(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, loss_type='object_condensation',
+        )
+        assert hasattr(model, 'oc_beta_head')
+        assert hasattr(model, 'oc_embedding_head')
+        points, features, lorentz_vectors, mask, track_labels = (
+            _make_training_inputs()
+        )
+        model.train()
+        loss_dict = model.compute_loss(
+            points, features, lorentz_vectors, mask, track_labels,
+            use_contrastive_denoising=False,
+        )
+        assert torch.isfinite(loss_dict['ranking_loss'])
+        assert torch.isfinite(loss_dict['total_loss'])
+
+    def test_mpm_pretrain_loss_is_finite(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, loss_type='mpm_pretrain',
+        )
+        assert hasattr(model, 'mpm_reconstruction_head')
+        model.apply_mpm_masking = True
+        points, features, lorentz_vectors, mask, track_labels = (
+            _make_training_inputs()
+        )
+        model.train()
+        loss_dict = model.compute_loss(
+            points, features, lorentz_vectors, mask, track_labels,
+            use_contrastive_denoising=False,
+        )
+        assert torch.isfinite(loss_dict['ranking_loss'])
+        assert loss_dict['ranking_loss'].item() >= 0.0

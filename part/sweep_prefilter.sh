@@ -104,10 +104,14 @@ declare -A EXPERIMENTS=(
     [E2e]="--use-edge-features --num-neighbors 64 --num-message-rounds 2"
     [E3]="--use-edge-features --loss-type listwise_ce"
     [E4]="--use-edge-features --loss-type logit_adjust --logit-adjust-tau 1.0"
+    [E5]="--use-edge-features --loss-type object_condensation --clustering-dim 8"
     [E6]="--use-edge-features --aggregation-mode pna"
+    [E7]="--use-edge-features --use-xgb-stub-feature"
     [E8]="--num-message-rounds 0"
     [E9]="--use-edge-features --loss-type infonce --listwise-temperature 0.5"
+    [E10]="--use-edge-features --loss-type mpm_pretrain --mpm-mask-ratio 0.15"
     [E11]="--use-edge-features --use-augmentation"
+    [E12]="--use-edge-features --use-self-distillation --ema-decay 0.999 --kl-weight 0.1"
 )
 
 # Order matters — this is the scheduling order for the sweep.
@@ -117,10 +121,14 @@ EXPERIMENT_ORDER=(
     E2a E2b E2c E2d E2e
     E3
     E4
+    E5
     E6
+    E7
     E8
     E9
+    E10
     E11
+    E12
 )
 
 # If user specified experiments, filter the order.
