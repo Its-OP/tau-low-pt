@@ -126,14 +126,23 @@ class CoupleReranker(nn.Module):
         dropout: float = 0.1,
         ranking_num_samples: int = 50,
         ranking_temperature: float = 1.0,
+        couple_loss: str = 'pairwise',
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
+        if couple_loss not in ('pairwise', 'softmax-ce'):
+            raise ValueError(
+                f"couple_loss must be 'pairwise' or 'softmax-ce', "
+                f"got '{couple_loss}'",
+            )
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_residual_blocks = num_residual_blocks
         self.dropout_rate = dropout
         self.ranking_num_samples = ranking_num_samples
         self.ranking_temperature = ranking_temperature
+        self.couple_loss = couple_loss
+        self.label_smoothing = label_smoothing
 
         # Input projection: 51 → hidden_dim
         self.input_projection = nn.Sequential(
@@ -180,23 +189,19 @@ class CoupleReranker(nn.Module):
         couple_labels: torch.Tensor,
         couple_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Pairwise ranking loss on per-couple scores.
+        """Couple ranking loss — dispatches to the configured branch.
 
-        Mirrors `CascadeReranker._pairwise_ranking_loss`
-        (``weaver/weaver/nn/model/CascadeReranker.py:584``):
+        Two branches are supported (selected via ``self.couple_loss``):
 
-            L = T · softplus((s_neg − s_pos) / T)
+        * ``'pairwise'`` (default): softplus pairwise ranking loss
+          ``L = T · softplus((s_neg − s_pos) / T)`` averaged over all
+          (positive, negative) pairs per event, then over events.
+          Mirrors ``CascadeReranker._pairwise_ranking_loss``.
 
-        Per event:
-            1. Identify GT couples (positives) — entries where label > 0.5 AND
-               mask > 0.5.
-            2. Identify non-GT couples (negatives) — entries where label < 0.5
-               AND mask > 0.5.
-            3. Sample N = ``ranking_num_samples`` random negatives per event.
-            4. Compute the pairwise softplus loss across all (positive,
-               negative) pairs and average.
-            5. Average over events that contain at least one positive AND one
-               negative. Events with no positives are skipped.
+        * ``'softmax-ce'``: listwise softmax cross-entropy (ListMLE
+          top-1). For each positive ``p_i`` in an event, the loss is
+          ``L_i = −s_{p_i}/T + logsumexp([s_{p_i}, s_{negs}]/T)``,
+          optionally smoothed by ``self.label_smoothing``.
 
         Args:
             couple_features: ``(B, input_dim, C)`` per-couple features.
@@ -204,10 +209,29 @@ class CoupleReranker(nn.Module):
             couple_mask: ``(B, C)`` validity mask (1 = real, 0 = padded).
 
         Returns:
-            dict with ``'total_loss'`` and ``'ranking_loss'`` (both scalar
-            tensors).
+            dict with ``'total_loss'``, ``'ranking_loss'``, ``'_scores'``.
         """
         scores = self.forward(couple_features)  # (B, C)
+        if self.couple_loss == 'softmax-ce':
+            ranking_loss = self._softmax_ce_loss(
+                scores, couple_labels, couple_mask,
+            )
+        else:
+            ranking_loss = self._pairwise_loss(
+                scores, couple_labels, couple_mask,
+            )
+        return {
+            'total_loss': ranking_loss,
+            'ranking_loss': ranking_loss,
+            '_scores': scores,
+        }
+
+    def _pairwise_loss(
+        self,
+        scores: torch.Tensor,
+        couple_labels: torch.Tensor,
+        couple_mask: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size = scores.shape[0]
         temperature = self.ranking_temperature
         event_losses: list[torch.Tensor] = []
@@ -244,16 +268,82 @@ class CoupleReranker(nn.Module):
             event_losses.append(pairwise_loss.mean())
 
         if not event_losses:
-            # Connect the zero loss to the graph via `scores.sum() * 0.0`
-            # so that `loss.backward()` works in batches that happen to
-            # contain no GT couples (~10-20% of batches in real training).
-            # The gradient is still zero, so no parameter is updated.
-            ranking_loss = scores.sum() * 0.0
-        else:
-            ranking_loss = torch.stack(event_losses).mean()
+            return scores.sum() * 0.0
+        return torch.stack(event_losses).mean()
 
-        return {
-            'total_loss': ranking_loss,
-            'ranking_loss': ranking_loss,
-            '_scores': scores,
-        }
+    def _softmax_ce_loss(
+        self,
+        scores: torch.Tensor,
+        couple_labels: torch.Tensor,
+        couple_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Listwise softmax cross-entropy loss.
+
+        For each positive ``p_i`` in an event, build the candidate pool
+        ``{p_i} ∪ sample(negs, N)`` and compute
+
+            L_i = −log p_i + ε · (−1/M · Σ_j log p_j − log p_i)
+                = (1 − ε) · (−s_{p_i}/T + logsumexp(s_pool/T))
+                  + ε · (−mean(s_pool)/T + logsumexp(s_pool/T))
+
+        where ``M = len(pool)`` and ``ε = self.label_smoothing``. With
+        ``ε = 0`` this reduces to the plain listwise softmax-CE (a.k.a.
+        ListMLE top-1), which directly optimizes P(positive ranked first).
+        """
+        batch_size = scores.shape[0]
+        temperature = self.ranking_temperature
+        eps = self.label_smoothing
+        event_losses: list[torch.Tensor] = []
+
+        for event_index in range(batch_size):
+            event_scores = scores[event_index]
+            event_labels = couple_labels[event_index]
+            event_valid = couple_mask[event_index] > 0.5
+
+            positive_indices = (
+                (event_labels > 0.5) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            negative_indices = (
+                (event_labels < 0.5) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            if len(positive_indices) == 0 or len(negative_indices) == 0:
+                continue
+
+            num_samples = min(
+                self.ranking_num_samples, len(negative_indices),
+            )
+            sample_indices = torch.randint(
+                0, len(negative_indices), (num_samples,),
+                device=scores.device,
+            )
+            sampled_negatives = negative_indices[sample_indices]
+            negative_scores = event_scores[sampled_negatives]
+
+            positive_losses: list[torch.Tensor] = []
+            for positive_index in positive_indices:
+                positive_score = event_scores[positive_index]
+                pool_scores = torch.cat(
+                    [positive_score.unsqueeze(0), negative_scores],
+                )
+                scaled_pool = pool_scores / temperature
+                log_normalizer = torch.logsumexp(scaled_pool, dim=0)
+
+                nll = -positive_score / temperature + log_normalizer
+                if eps > 0.0:
+                    pool_size = pool_scores.shape[0]
+                    uniform_nll = (
+                        -scaled_pool.mean() + log_normalizer
+                    )
+                    smoothed = (
+                        (1.0 - eps) * nll + eps * uniform_nll
+                    )
+                    positive_losses.append(smoothed)
+                else:
+                    positive_losses.append(nll)
+
+            event_losses.append(torch.stack(positive_losses).mean())
+
+        if not event_losses:
+            return scores.sum() * 0.0
+        return torch.stack(event_losses).mean()

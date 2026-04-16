@@ -194,6 +194,141 @@ class TestComputeLoss:
 
 
 # ---------------------------------------------------------------------------
+# Softmax-CE loss branch (T1.1 of the couple-reranker improvement sweep)
+# ---------------------------------------------------------------------------
+
+class TestSoftmaxCELoss:
+    def test_invalid_loss_name_rejected(self):
+        with pytest.raises(ValueError):
+            CoupleReranker(couple_loss='bce')
+
+    def test_softmax_ce_loss_dict_shape(self):
+        model = CoupleReranker(couple_loss='softmax-ce')
+        couple_features = torch.randn(2, 51, 100)
+        couple_labels = torch.zeros(2, 100)
+        couple_labels[:, [0, 1, 2]] = 1.0
+        couple_mask = torch.ones(2, 100)
+        loss_dict = model.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )
+        assert 'total_loss' in loss_dict
+        assert 'ranking_loss' in loss_dict
+        assert '_scores' in loss_dict
+        assert loss_dict['total_loss'].dim() == 0
+        assert torch.isfinite(loss_dict['total_loss'])
+
+    def test_softmax_ce_handles_padding(self):
+        model = CoupleReranker(couple_loss='softmax-ce')
+        couple_features = torch.randn(2, 51, 100)
+        couple_labels = torch.zeros(2, 100)
+        couple_labels[:, 0] = 1.0
+        couple_mask = torch.zeros(2, 100)
+        couple_mask[:, :50] = 1.0
+        loss_dict = model.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )
+        assert torch.isfinite(loss_dict['total_loss'])
+
+    def test_softmax_ce_zero_when_no_gt_anywhere(self):
+        model = CoupleReranker(couple_loss='softmax-ce')
+        couple_features = torch.randn(2, 51, 100)
+        couple_labels = torch.zeros(2, 100)
+        couple_mask = torch.ones(2, 100)
+        loss_dict = model.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )
+        assert loss_dict['total_loss'].item() == 0.0
+
+    def test_softmax_ce_loss_is_negative_log_prob_of_positive(self):
+        """When scores are fixed and exactly 1 positive + N negatives, the
+        loss must equal -log(exp(s_pos) / sum_j exp(s_j))."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='softmax-ce')
+        # Override the model's forward to return a deterministic score
+        # tensor so we can compute the analytic answer.
+        s_pos = 3.0
+        s_neg = 1.0
+        n_neg = 10
+        scores = torch.tensor([[s_pos] + [s_neg] * n_neg])  # (1, 1+N)
+        couple_labels = torch.tensor([[1.0] + [0.0] * n_neg])
+        couple_mask = torch.ones_like(couple_labels)
+        model.ranking_num_samples = n_neg
+        loss = model._softmax_ce_loss(scores, couple_labels, couple_mask)
+        import math as _math
+        expected = -s_pos + _math.log(_math.exp(s_pos) + n_neg * _math.exp(s_neg))
+        assert abs(loss.item() - expected) < 1e-5
+
+    def test_softmax_ce_overfits_tiny_task(self):
+        """softmax-CE must also be able to overfit the same tiny task."""
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            hidden_dim=64, num_residual_blocks=2, couple_loss='softmax-ce',
+        )
+        n_events = 4
+        n_couples = 30
+        couple_features = torch.randn(n_events, 51, n_couples) * 0.1
+        couple_features[:, :, :3] *= 5.0
+        couple_labels = torch.zeros(n_events, n_couples)
+        couple_labels[:, :3] = 1.0
+        couple_mask = torch.ones(n_events, n_couples)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        initial_loss = None
+        for step in range(200):
+            optimizer.zero_grad()
+            loss = model.compute_loss(
+                couple_features, couple_labels, couple_mask,
+            )['total_loss']
+            if step == 0:
+                initial_loss = loss.item()
+            loss.backward()
+            optimizer.step()
+        final_loss = loss.item()
+        assert final_loss < initial_loss * 0.5, (
+            f'Loss did not decrease: initial={initial_loss:.4f}, '
+            f'final={final_loss:.4f}'
+        )
+
+    def test_label_smoothing_reduces_to_plain_at_zero(self):
+        torch.manual_seed(0)
+        model_plain = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
+        model_smoothed = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
+        model_smoothed.load_state_dict(model_plain.state_dict())
+
+        couple_features = torch.randn(2, 51, 40)
+        couple_labels = torch.zeros(2, 40)
+        couple_labels[:, [0, 1]] = 1.0
+        couple_mask = torch.ones(2, 40)
+
+        l_plain = model_plain.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        l_smoothed = model_smoothed.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        assert abs(l_plain.item() - l_smoothed.item()) < 1e-6
+
+    def test_label_smoothing_changes_loss_value(self):
+        torch.manual_seed(0)
+        model_a = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.0)
+        model_b = CoupleReranker(couple_loss='softmax-ce', label_smoothing=0.1)
+        model_b.load_state_dict(model_a.state_dict())
+
+        couple_features = torch.randn(2, 51, 40)
+        couple_labels = torch.zeros(2, 40)
+        couple_labels[:, [0, 1]] = 1.0
+        couple_mask = torch.ones(2, 40)
+
+        l_a = model_a.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        l_b = model_b.compute_loss(
+            couple_features, couple_labels, couple_mask,
+        )['total_loss']
+        assert l_a.item() != l_b.item()
+
+
+# ---------------------------------------------------------------------------
 # Synthetic overfit check
 # ---------------------------------------------------------------------------
 

@@ -467,6 +467,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--couple-dropout', type=float, default=0.1)
     parser.add_argument('--couple-ranking-num-samples', type=int, default=50)
     parser.add_argument('--couple-ranking-temperature', type=float, default=1.0)
+    parser.add_argument(
+        '--couple-loss',
+        type=str,
+        default='pairwise',
+        choices=['pairwise', 'softmax-ce'],
+        help=(
+            "Couple-reranker loss branch. 'pairwise' = softplus pairwise "
+            "ranking (default, legacy). 'softmax-ce' = listwise softmax "
+            "cross-entropy (ListMLE top-1), which directly optimizes "
+            "P(positive ranked first)."
+        ),
+    )
+    parser.add_argument(
+        '--couple-label-smoothing',
+        type=float,
+        default=0.0,
+        help=(
+            'Label smoothing ε applied to the softmax-CE branch only. '
+            '0.0 = plain cross-entropy. Typical: 0.05-0.10.'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -652,6 +673,8 @@ def main():
         couple_dropout=args.couple_dropout,
         couple_ranking_num_samples=args.couple_ranking_num_samples,
         couple_ranking_temperature=args.couple_ranking_temperature,
+        couple_loss=args.couple_loss,
+        couple_label_smoothing=args.couple_label_smoothing,
     )
     model = model.to(device)
 
