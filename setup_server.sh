@@ -24,7 +24,7 @@ WEAVER_REPO="https://github.com/Its-OP/weaver-core-low-pt.git"
 CONDA_ENV_NAME="part"
 PYTHON_VERSION="3.13"
 # Google Drive file ID for the split parquet data archive (train/ + val/)
-GDRIVE_DATA_ZIP_ID="16kcU8brsl2QrcbqO43NXeP7jvejGm7au"
+GDRIVE_DATA_ZIP_ID="1RaKiErLJTNlM5Y4OSn0fOvKCc-Zh61FM"
 
 echo "============================================"
 echo "  Low-pT Tau Backbone — Server Setup"
@@ -69,7 +69,7 @@ if [ "$TRAIN_COUNT" -lt 10 ] || [ "$VAL_COUNT" -lt 10 ]; then
     pip install -q gdown 2>/dev/null || pip3 install -q gdown
 
     echo "  Downloading split data (train + val)..."
-    gdown "https://drive.google.com/uc?id=${GDRIVE_DATA_ZIP_ID}" -O "${ZIP_PATH}" --fuzzy
+    gdown "https://drive.google.com/uc?id=${GDRIVE_DATA_ZIP_ID}" -O "${ZIP_PATH}"
 
     # Validate download is not an HTML error page
     FILE_SIZE_BYTES=$(wc -c < "${ZIP_PATH}" | tr -d ' ')
