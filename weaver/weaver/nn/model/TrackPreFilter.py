@@ -722,24 +722,35 @@ class TrackPreFilter(nn.Module):
         labels: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Temperature-scaled pairwise ranking loss optimized for recall@K.
+        """Dispatches to the configured supervision loss.
 
-        For each GT pion, sample S negatives and penalize negatives
-        scoring above positives:
-            L = T * softplus((s_neg - s_pos) / T)
-
-        At T=1.0, this reduces to standard softplus(s_neg - s_pos).
-        High T smooths gradients across more pairs; low T sharpens
-        focus on hard violations near the decision boundary.
-
-        When DRW is active, the loss is scaled by drw_positive_weight
-        to upweight the rare positive class.
-
-        # TODO: Vectorize this loop across the batch using padded positives
-        # and a single torch.randint call. The per-event loop is kept for now
-        # because the main cost savings come from the vectorized contrastive
-        # denoising loss (Opt 2), and this loop operates on tiny tensors.
+        ``self.loss_type`` picks the objective:
+            - ``'pairwise'`` (default) — temperature-scaled softplus
+              pairwise ranking. Math: ``L = T · softplus((s_neg − s_pos) / T)``.
+            - ``'listwise_ce'`` — event-wise softmax cross-entropy.
+            - ``'infonce'`` — InfoNCE per positive anchor.
+            - ``'logit_adjust'`` — pairwise with Menon 2007.07314 offset
+              added to negative logits during training only.
+            - ``'object_condensation'`` — must be handled by the caller
+              because it needs embedding + β outputs, not just scores.
         """
+        from weaver.nn.model.prefilter_losses import (
+            infonce_in_event,
+            listwise_ce_loss,
+            logit_adjust_offset,
+        )
+
+        if self.loss_type == 'listwise_ce':
+            return listwise_ce_loss(
+                scores, labels, valid_mask,
+                temperature=self.listwise_temperature,
+            )
+        if self.loss_type == 'infonce':
+            return infonce_in_event(
+                scores, labels, valid_mask,
+                temperature=self.listwise_temperature,
+            )
+
         batch_size = scores.shape[0]
         temperature = self.current_ranking_temperature
         event_losses = []
@@ -768,6 +779,19 @@ class TrackPreFilter(nn.Module):
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
+
+            # Menon 2007.07314 logit adjustment: add τ·log(π_neg/π_pos) to
+            # negative logits during training only. π estimated from this
+            # event's valid counts. Exposes "balanced-error" optimality on
+            # the extreme-imbalance regime (3 / ~1100).
+            if self.loss_type == 'logit_adjust':
+                offset = logit_adjust_offset(
+                    num_positives=len(positive_indices),
+                    num_negatives=len(negative_indices),
+                    tau=self.logit_adjust_tau,
+                )
+                if offset != 0.0:
+                    negative_scores = negative_scores + offset
 
             # L = T × log(1 + exp((s_neg - s_pos) / T))
             # At T=1: standard softplus. At T>1: smoother. At T<1: sharper.
