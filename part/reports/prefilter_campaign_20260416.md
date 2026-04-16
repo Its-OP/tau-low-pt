@@ -58,20 +58,48 @@ Ran `bash sweep_prefilter.sh smoke` on vast.ai. 13 experiments, 1 epoch × 50 st
 
 ### Overnight full sweep (handoff)
 
-Invocation on server:
+All 17 experiments hidden behind feature flags. Launch inside ``screen``
+so an SSH disconnect does not kill the run:
+
 ```bash
-ssh -p 12971 root@ssh9.vast.ai "cd /workspace/tau-low-pt && git pull && cd part && \
-  nohup bash sweep_prefilter.sh full > /workspace/logs/sweep_full_master.log 2>&1 & \
-  echo PID=\$!"
+ssh -p 12971 root@ssh9.vast.ai \
+  "cd /workspace/tau-low-pt && git pull && cd part && \
+   screen -dmS sweep_full bash -c \
+     'bash sweep_prefilter.sh full > /workspace/logs/sweep_full_master.log 2>&1'"
 ```
 
-Per-experiment: 20 epochs × 500 steps × BS=256 × AMP, ~10 workers. Each run ~15-25 min. 13 experiments × ~20 min ≈ **4.5 hours total**.
+Reattach to watch progress:
+```bash
+ssh -p 12971 root@ssh9.vast.ai
+# then on server:
+screen -r sweep_full     # reattach (detach again with Ctrl+A, D)
+```
+
+Per-experiment: 20 epochs × 500 steps × BS=256 × AMP, ~10 workers. Each run ~15-25 min. **17 experiments** × ~20 min ≈ **5.5 hours total**.
 
 Summary lands at `/workspace/logs/sweep_full_summary.txt`. Per-experiment checkpoints at `/workspace/experiments/sweep_full_<exp>_PreFilter_<ts>/`.
 
-Skipped from this campaign (deferred):
-- E5 (object condensation loss) — needs β head wiring in TrackPreFilter scorer.
-- E7 (XGBoost score as feature) — needs data-pipeline change + XGB training.
-- E10 (masked particle modeling SSL pretrain) — needs `part/pretrain_prefilter_mpm.py`.
-- E12 (self-distillation EMA) — needs EMA teacher wrapper in the train loop.
+Experiment roster:
+| ID | Flags | Hypothesis |
+|----|-------|-----------|
+| BASELINE | (none) | Current production config |
+| E1 | `--use-edge-features` | Pairwise LV edge features (+0.02–0.04 estimated) |
+| E2a-e | edge + k/rounds grid | Larger receptive field |
+| E3 | edge + `--loss-type listwise_ce` | Event-wise softmax CE |
+| E4 | edge + `--loss-type logit_adjust` | Menon 2007.07314 class-prior offset |
+| E5 | edge + `--loss-type object_condensation` | Kieseler 2002.03605 |
+| E6 | edge + `--aggregation-mode pna` | PNA multi-aggregator |
+| E7 | edge + `--use-xgb-stub-feature` | DeepGBM-style hybrid (stub) |
+| E8 | `--num-message-rounds 0` | Aggregation ablation |
+| E9 | edge + `--loss-type infonce` | InfoNCE per positive |
+| E10 | edge + `--loss-type mpm_pretrain` | Masked particle modeling SSL |
+| E11 | edge + `--use-augmentation` | JetCLR augmentations |
+| E12 | edge + `--use-self-distillation` | EMA teacher + KL distillation |
+
+Real-XGBoost (E7 proper): the current flag wires a frozen random-init
+linear stub standing in for a pre-trained per-track XGBoost score.
+Replace the stub by training XGBoost once and swapping the stub weights
+— or by caching scores to parquet and adding the column to the data
+config. Stub exists purely to exercise the 17-dim input path in the
+smoke sweep.
 
