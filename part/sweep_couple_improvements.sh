@@ -8,10 +8,19 @@
 # architecture; each one toggles a single feature flag (or stacks a few)
 # so we can attribute gains to specific changes.
 #
+# By default the sweep self-relaunches in a detached `screen` session so
+# it survives SSH disconnects. Set NO_SCREEN=1 to run inline.
+#
 # Usage:
-#   bash sweep_couple_improvements.sh                   # full overnight run
-#   SMOKE_MODE=1 bash sweep_couple_improvements.sh      # 1-epoch smoke
+#   bash sweep_couple_improvements.sh                   # full overnight run (screen)
+#   SMOKE_MODE=1 bash sweep_couple_improvements.sh      # 1-epoch smoke (screen)
+#   NO_SCREEN=1 bash sweep_couple_improvements.sh       # run inline (debugging)
 #   EXPERIMENTS="T0_baseline T1_1_listmle" bash ...     # subset
+#
+# Reattach a detached sweep:
+#   screen -r couple_sweep
+# Kill a detached sweep:
+#   screen -S couple_sweep -X quit
 #
 # Outputs:
 #   experiments/couple_improvements_{smoke_,}<timestamp>/
@@ -26,6 +35,45 @@
 set -euo pipefail
 
 SMOKE_MODE="${SMOKE_MODE:-0}"
+SESSION_NAME="${SESSION_NAME:-couple_sweep}"
+
+# ---- Self-relaunch in detached screen (unless we're already inside
+# screen or the caller set NO_SCREEN=1). STY is set by screen for its
+# children, so we use that to detect the inner run.
+if [ -z "${STY:-}" ] && [ "${NO_SCREEN:-0}" != "1" ]; then
+    if ! command -v screen &>/dev/null; then
+        echo "ERROR: screen not installed. Install it or pass NO_SCREEN=1." >&2
+        exit 1
+    fi
+    if screen -list 2>/dev/null | grep -q "\.${SESSION_NAME}"; then
+        echo "Screen session '${SESSION_NAME}' already exists." >&2
+        echo "Reattach: screen -r ${SESSION_NAME}" >&2
+        echo "Kill:     screen -S ${SESSION_NAME} -X quit" >&2
+        exit 1
+    fi
+
+    # Forward relevant env vars so the child sees the same config.
+    CHILD_ENV=""
+    for var in SMOKE_MODE EPOCHS STEPS_PER_EPOCH BATCH_SIZE NUM_WORKERS \
+               KEEP_BEST_K BN_CALIBRATION_STEPS TOP_K2 SEED DEVICE \
+               DATA_CONFIG DATA_DIR VAL_DATA_DIR NETWORK CASCADE_CHECKPOINT \
+               EXPERIMENTS; do
+        if [ -n "${!var:-}" ]; then
+            CHILD_ENV+="${var}='${!var}' "
+        fi
+    done
+
+    screen -dmS "${SESSION_NAME}" bash -c "
+        ${CHILD_ENV} NO_SCREEN=1 bash '${BASH_SOURCE[0]}'
+        echo ''
+        echo '--- Sweep finished. Press Enter to close this screen session. ---'
+        read -r
+    "
+    echo "Sweep launched in detached screen session '${SESSION_NAME}'."
+    echo "Reattach: screen -r ${SESSION_NAME}"
+    echo "Kill:     screen -S ${SESSION_NAME} -X quit"
+    exit 0
+fi
 
 # ---- Common training config (overridable via env vars) ----
 DATA_CONFIG="${DATA_CONFIG:-data/low-pt/lowpt_tau_trackfinder.yaml}"
