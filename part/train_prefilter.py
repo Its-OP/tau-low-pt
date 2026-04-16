@@ -341,6 +341,59 @@ def main():
              'Applied after each ReLU in the mlp-mode track_mlp, '
              'neighbor_mlps, and scorer. Set to 0 to disable.',
     )
+    # --- Architecture knobs (prefilter improvement campaign) ---
+    parser.add_argument(
+        '--num-neighbors', type=int, default=16,
+        help='k for k-NN neighbor aggregation (default: 16).',
+    )
+    parser.add_argument(
+        '--num-message-rounds', type=int, default=2,
+        help='Number of k-NN message-passing rounds (default: 2). '
+             'Set to 0 for the aggregation-ablation experiment.',
+    )
+    parser.add_argument(
+        '--aggregation-mode', type=str, default='max',
+        choices=['max', 'pna'],
+        help='Neighbor aggregation: max-pool (default) or PNA '
+             '(cat of mean, max, min, std).',
+    )
+    parser.add_argument(
+        '--use-edge-features', action='store_true',
+        help='Append pairwise_lv_fts (ln kT, ln z, ln ΔR, ln m²) '
+             'max-pooled over the k-NN to the aggregation input '
+             '(+4 channels).',
+    )
+    # --- Loss switch (prefilter improvement campaign) ---
+    parser.add_argument(
+        '--loss-type', type=str, default='pairwise',
+        choices=[
+            'pairwise', 'listwise_ce', 'infonce',
+            'logit_adjust', 'object_condensation',
+        ],
+        help='Per-event supervision loss. Default pairwise matches '
+             'the historical TrackPreFilter ranking objective.',
+    )
+    parser.add_argument(
+        '--logit-adjust-tau', type=float, default=1.0,
+        help='τ for Menon 2007.07314 logit adjustment. Only used when '
+             '--loss-type=logit_adjust.',
+    )
+    parser.add_argument(
+        '--listwise-temperature', type=float, default=1.0,
+        help='Temperature for listwise_ce / infonce loss.',
+    )
+    # --- Regularisation / augmentation / SSL ---
+    parser.add_argument(
+        '--use-augmentation', action='store_true',
+        help='Apply set-friendly train-time augmentations '
+             '(track dropout, feature jitter, η-φ rotation).',
+    )
+    parser.add_argument(
+        '--ssl-pretrain-ckpt', type=str, default=None,
+        help='Load backbone weights (track_mlp, neighbor_mlps) from a '
+             'masked-particle-modeling SSL pretrain checkpoint before '
+             'supervised training starts.',
+    )
     parser.add_argument('--train-fraction', type=float, default=0.8,
                         help='Fraction of data-dir for training (ignored if --val-data-dir set)')
     parser.add_argument('--val-data-dir', type=str, default=None,
@@ -489,6 +542,13 @@ def main():
     model, model_info = network_module.get_model(
         data_config,
         dropout=args.dropout,
+        num_neighbors=args.num_neighbors,
+        num_message_rounds=args.num_message_rounds,
+        aggregation_mode=args.aggregation_mode,
+        use_edge_features=args.use_edge_features,
+        loss_type=args.loss_type,
+        logit_adjust_tau=args.logit_adjust_tau,
+        listwise_temperature=args.listwise_temperature,
     )
     model = model.to(device)
 

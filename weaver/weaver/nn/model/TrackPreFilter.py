@@ -61,6 +61,10 @@ class TrackPreFilter(nn.Module):
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
         dropout: float = 0.0,
+        use_edge_features: bool = False,
+        loss_type: str = 'pairwise',
+        logit_adjust_tau: float = 1.0,
+        listwise_temperature: float = 1.0,
     ):
         super().__init__()
         self.mode = mode
@@ -98,6 +102,23 @@ class TrackPreFilter(nn.Module):
         # PNA multi-aggregation (Corso et al., NeurIPS 2020):
         # 'max' = standard max-pool, 'pna' = cat([mean, max, min, std])
         self.aggregation_mode = aggregation_mode
+
+        # Pairwise LV edge features on k-NN edges (ParT-style).
+        # When True, each message round appends max-pooled pairwise_lv_fts
+        # (4 channels: ln kT, ln z, ln ΔR, ln m²) to the neighbor aggregation.
+        # Requires lorentz_vectors to be supplied to forward().
+        self.use_edge_features = use_edge_features
+        self.edge_feature_dim = 4 if use_edge_features else 0
+
+        # Supervision loss dispatcher — consumed by ``_ranking_loss``.
+        #   'pairwise'            — legacy softplus pairwise ranking (default)
+        #   'listwise_ce'         — event-wise softmax cross-entropy
+        #   'infonce'             — InfoNCE with in-event hard negatives
+        #   'logit_adjust'        — pairwise with Menon 2007.07314 offset
+        #   'object_condensation' — Kieseler 2002.03605 attractive/repulsive
+        self.loss_type = loss_type
+        self.logit_adjust_tau = logit_adjust_tau
+        self.listwise_temperature = listwise_temperature
 
         # Equalized focal weighting (Li et al., CVPR 2022):
         # 0.0 = disabled, >0 = smooth (1-p)^γ modulation on pairwise loss.
@@ -160,6 +181,9 @@ class TrackPreFilter(nn.Module):
             else:
                 # Standard: cat([current, max_pooled]) = 2 * hidden_dim
                 neighbor_input_dim = 2 * hidden_dim
+            # Edge-feature augmentation adds 4 pairwise_lv_fts channels
+            # (ln kT, ln z, ln ΔR, ln m²), max-pooled across the k-NN.
+            neighbor_input_dim += self.edge_feature_dim
 
             def _build_neighbor_mlp() -> nn.Sequential:
                 layers: list[nn.Module] = [
@@ -319,7 +343,7 @@ class TrackPreFilter(nn.Module):
             self._lorentz_cache = lorentz_vectors
 
         if self.mode == 'mlp':
-            scores = self._forward_mlp(points, features, mask)
+            scores = self._forward_mlp(points, features, lorentz_vectors, mask)
         elif self.mode == 'two_tower':
             scores = self._forward_two_tower(features, mask)
         elif self.mode == 'autoencoder':
@@ -386,9 +410,17 @@ class TrackPreFilter(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Mode A: Per-track MLP with multi-round kNN neighborhood context."""
+        """Mode A: Per-track MLP with multi-round kNN neighborhood context.
+
+        When ``self.use_edge_features`` is True, each message round
+        also gathers the neighbors' 4-vectors and appends the 4 pairwise
+        LV features (ln kT, ln z, ln ΔR, ln m²), max-pooled over the
+        k-NN, to the aggregation. The LV path is detached (see
+        ``build_cross_set_edge_features``) to avoid √(ΔR²) backward NaNs.
+        """
         mask_float = mask.float()
 
         # Per-track embedding
@@ -403,6 +435,16 @@ class TrackPreFilter(nn.Module):
                 reference_mask=mask,
                 query_reference_indices=None,
             )
+
+        # Edge features — computed once per forward since only dependent
+        # on the kNN graph + Lorentz vectors, not on the evolving
+        # embedding. Max-pooled across K to produce a (B, 4, P) tensor.
+        if self.use_edge_features:
+            edge_max_pooled = self._compute_edge_max_pooled(
+                lorentz_vectors, mask_float, neighbor_indices,
+            )
+        else:
+            edge_max_pooled = None
 
         # Multi-round message passing
         current = track_embedding
@@ -431,11 +473,66 @@ class TrackPreFilter(nn.Module):
                 )
                 aggregated = torch.cat([current, max_pooled], dim=1)
 
+            if edge_max_pooled is not None:
+                aggregated = torch.cat([aggregated, edge_max_pooled], dim=1)
+
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
         # Score
         scores = self.scorer(current).squeeze(1)  # (B, P)
         return scores
+
+    def _compute_edge_max_pooled(
+        self,
+        lorentz_vectors: torch.Tensor,
+        mask_float: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pairwise LV features, max-pooled across the k-NN.
+
+        Math (per edge (i, j) between centroid i and neighbor j):
+            ln ΔR = 0.5 · ln( (η_i − η_j)² + Δφ(φ_i, φ_j)² )
+            ln kT = ln( min(pT_i, pT_j) · ΔR )
+            ln z  = ln( min(pT_i, pT_j) / (pT_i + pT_j) )
+            ln m² = ln( (E_i + E_j)² − ‖p_i + p_j‖² )
+
+        These 4 features are computed with amp disabled and the LV
+        tensors detached, to avoid the 1/√ΔR² backward blow-up that
+        hits nearly-collinear edges. After pooling over the k
+        neighbors, the result is a (B, 4, P) tensor that can be
+        appended to the round-level aggregation input.
+        """
+        from weaver.nn.model.ParticleTransformer import pairwise_lv_fts
+
+        # Gather neighbor 4-vectors: (B, 4, P, K)
+        neighbor_lorentz_vectors = cross_set_gather(
+            lorentz_vectors, neighbor_indices,
+        )
+        neighbor_validity = cross_set_gather(
+            mask_float, neighbor_indices,
+        )
+
+        center_lorentz_expanded = lorentz_vectors.unsqueeze(-1).expand_as(
+            neighbor_lorentz_vectors,
+        )
+        # Autocast off + detach + float32: same recipe as
+        # build_cross_set_edge_features in HierarchicalGraphBackbone.
+        with torch.amp.autocast('cuda', enabled=False):
+            lv_features = pairwise_lv_fts(
+                center_lorentz_expanded.detach().float(),
+                neighbor_lorentz_vectors.detach().float(),
+                num_outputs=4,
+            )  # (B, 4, P, K), float32
+        lv_features = lv_features.to(lorentz_vectors.dtype)
+        # Mask invalid neighbors with -inf so max-pool ignores them
+        lv_features = lv_features.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+        lv_max_pooled = lv_features.max(dim=-1)[0]
+        lv_max_pooled = lv_max_pooled.masked_fill(
+            lv_max_pooled == float('-inf'), 0.0,
+        )
+        return lv_max_pooled  # (B, 4, P)
 
     def _forward_two_tower(
         self,
