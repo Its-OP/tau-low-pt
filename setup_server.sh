@@ -19,8 +19,8 @@
 set -euo pipefail
 
 # ---- Configuration ----
-PART_REPO="https://github.com/Its-OP/particle_transformer_lowpt_tau.git"
-WEAVER_REPO="https://github.com/Its-OP/weaver-core-low-pt.git"
+ORIGIN_REPO="https://github.com/Its-OP/tau-low-pt.git"
+REPO_DIR="tau-low-pt"
 CONDA_ENV_NAME="part"
 PYTHON_VERSION="3.13"
 # Google Drive file ID for the split parquet data archive (train/ + val/)
@@ -30,25 +30,26 @@ echo "============================================"
 echo "  Low-pT Tau Backbone — Server Setup"
 echo "============================================"
 
-# ---- Step 1: Clone repositories ----
+# ---- Step 1: Fetch monorepo (part/ and weaver/ are subdirectories) ----
 echo ""
-echo "[1/4] Cloning repositories..."
+echo "[1/4] Fetching monorepo..."
 
-if [ -d "part" ]; then
-    echo "  'part/' already exists, pulling latest changes..."
-    cd part && git pull && cd ..
+if [ -d ".git" ] && git remote get-url origin 2>/dev/null | grep -q "tau-low-pt"; then
+    echo "  Already inside the monorepo, pulling latest changes..."
+    git fetch origin
+    git checkout main
+    git pull origin main
 else
-    git clone "$PART_REPO" part
+    if [ -d "${REPO_DIR}" ]; then
+        echo "  '${REPO_DIR}/' already exists, pulling latest changes..."
+        cd "${REPO_DIR}" && git pull && cd ..
+    else
+        git clone "$ORIGIN_REPO" "${REPO_DIR}"
+    fi
+    cd "${REPO_DIR}"
 fi
 
-if [ -d "weaver" ]; then
-    echo "  'weaver/' already exists, pulling latest changes..."
-    cd weaver && git pull && cd ..
-else
-    git clone "$WEAVER_REPO" weaver
-fi
-
-echo "  Repositories ready."
+echo "  Monorepo ready (part/ and weaver/ are subdirectories)."
 
 # ---- Step 2: Download and extract dataset ----
 echo ""

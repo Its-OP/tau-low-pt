@@ -4,7 +4,7 @@ Ensure that your code is modularized, so it remains easy to read and maintain.
 Always add comments with mathematical formulae to the sections of the code that implement them
 Ensure that your code relies on the best performance practices of PyTorch
 DO NOT use short names for the variables. Prefer proper names: attn->attention; ch->channel; conv->convolution; etc.
-You can assume that there is a created environment on the device, based on the ./particle_transformer_lowpt_tau/environment.yml file
+You can assume that there is a created environment on the device, based on the ./part/environment.yml file
 Usage of 'eval' is unsafe, and STRICTLY FORBIDDEN
 
 When debugging poor performance of the model, always look for a file of the training logs, and the checkpoint of the best results within the run. They will help you confirm or deny any findings. Of such files do not exist, ask the user to provide them.

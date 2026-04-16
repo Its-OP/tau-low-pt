@@ -244,7 +244,7 @@ chmod +x setup_server.sh
 ./setup_server.sh
 ```
 
-This will clone both repos, create the conda environment, install all dependencies, and download the dataset from Google Drive. After setup:
+This will clone the monorepo, create the conda environment, install all dependencies, and download the dataset from Google Drive. After setup:
 
 ```bash
 conda activate part
@@ -255,9 +255,7 @@ cd part && bash train_pretrain.sh
 
 | Script | Description |
 |--------|-------------|
-| `setup_server.sh` | Server setup: clone repos, conda env, dependencies, dataset download |
-| `part/pull.sh` | Pull latest changes for part (`bash pull.sh [branch]`, default: master) |
-| `weaver/pull.sh` | Pull latest changes for weaver (`bash pull.sh [branch]`, default: master) |
+| `setup_server.sh` | Server setup: clone monorepo, conda env, dependencies, dataset download |
 | `part/train_pretrain.sh` | Launch pretraining in screen (training + nvidia-smi monitoring) |
 | `part/pretrain_backbone.py` | Custom training script (AdamW, cosine schedule, AMP, TensorBoard) |
 | `part/train_trackfinder.sh` | Launch track finder training in screen |
