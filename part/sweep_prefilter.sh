@@ -54,21 +54,21 @@ LOG_DIR="${LOG_DIR:-/workspace/logs}"
 EXP_DIR="${EXP_DIR:-/workspace/experiments}"
 mkdir -p "${LOG_DIR}" "${EXP_DIR}"
 
-# ---- Mode-specific defaults ----
+# ---- Mode-specific defaults (each overridable via env var) ----
 if [ "${MODE}" = "smoke" ]; then
-    EPOCHS=1
-    BATCH_SIZE=128
-    STEPS_PER_EPOCH=50
-    NUM_WORKERS=4
-    AMP_FLAG=""
-    KEEP_BEST_K=1
+    EPOCHS="${EPOCHS:-1}"
+    BATCH_SIZE="${BATCH_SIZE:-128}"
+    STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-50}"
+    NUM_WORKERS="${NUM_WORKERS:-4}"
+    AMP_FLAG="${AMP_FLAG:-}"
+    KEEP_BEST_K="${KEEP_BEST_K:-1}"
 else
-    EPOCHS=20
-    BATCH_SIZE=256
-    STEPS_PER_EPOCH=500
-    NUM_WORKERS=10
-    AMP_FLAG="--amp"
-    KEEP_BEST_K=3
+    EPOCHS="${EPOCHS:-40}"
+    BATCH_SIZE="${BATCH_SIZE:-256}"
+    STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-500}"
+    NUM_WORKERS="${NUM_WORKERS:-10}"
+    AMP_FLAG="${AMP_FLAG:---amp}"
+    KEEP_BEST_K="${KEEP_BEST_K:-3}"
 fi
 
 # ---- Shared invariant args ----

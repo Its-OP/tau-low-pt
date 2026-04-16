@@ -75,7 +75,7 @@ ssh -p 12971 root@ssh9.vast.ai
 screen -r sweep_full     # reattach (detach again with Ctrl+A, D)
 ```
 
-Per-experiment: 20 epochs × 500 steps × BS=256 × AMP, ~10 workers. Each run ~15-25 min. **17 experiments** × ~20 min ≈ **5.5 hours total**.
+Per-experiment: **40 epochs** × 500 steps × BS=256 × AMP, ~10 workers. Each run ~30–45 min. **17 experiments** × ~40 min ≈ **11 hours total** (override via `EPOCHS=N bash sweep_prefilter.sh full`).
 
 Summary lands at `/workspace/logs/sweep_full_summary.txt`. Per-experiment checkpoints at `/workspace/experiments/sweep_full_<exp>_PreFilter_<ts>/`.
 
