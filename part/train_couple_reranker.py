@@ -148,6 +148,7 @@ def train_one_epoch(
     mask_input_index: int,
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
+    ema_model: torch.nn.Module | None = None,
 ) -> tuple[dict[str, float], int]:
     """Train the CoupleReranker for one epoch (frozen cascade inside)."""
     model.train()
@@ -209,6 +210,8 @@ def train_one_epoch(
             )
         optimizer.step()
         scheduler.step_batch()
+        if ema_model is not None:
+            ema_model.update_parameters(model.couple_reranker)
 
         if loss_accumulators is None:
             loss_accumulators = {
@@ -519,6 +522,17 @@ def _build_parser() -> argparse.ArgumentParser:
             'input_dim to 55.'
         ),
     )
+    parser.add_argument(
+        '--couple-ema-decay',
+        type=float,
+        default=0.0,
+        help=(
+            'Exponential moving average decay for the couple reranker '
+            "weights. 0 = disabled (default). Typical: 0.999 (averages "
+            '~1000 updates). The EMA copy is BN-recalibrated at the end '
+            'of training and saved as best_model_ema_calibrated.pt.'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -769,6 +783,28 @@ def main():
         criterion_name='C@100',
     )
 
+    # ---- Optional EMA (T2.3) ----
+    ema_model = None
+    if args.couple_ema_decay > 0.0:
+        if not 0.0 < args.couple_ema_decay < 1.0:
+            raise ValueError(
+                f'--couple-ema-decay must be in (0, 1), got '
+                f'{args.couple_ema_decay}',
+            )
+        decay = args.couple_ema_decay
+        ema_model = torch.optim.swa_utils.AveragedModel(
+            model.couple_reranker,
+            avg_fn=(
+                lambda averaged, current, n: (
+                    decay * averaged + (1.0 - decay) * current
+                )
+            ),
+        )
+        logger.info(
+            f'EMA enabled for couple_reranker (decay={decay}); '
+            'saved as best_model_ema_calibrated.pt after training.',
+        )
+
     # ---- TensorBoard ----
     from torch.utils.tensorboard import SummaryWriter
     tensorboard_writer = SummaryWriter(tensorboard_dir)
@@ -816,6 +852,7 @@ def main():
                 tensorboard_writer, global_batch_count,
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
+                ema_model=ema_model,
             )
 
             eval_steps = max(1, steps_per_epoch // 2)
@@ -948,6 +985,54 @@ def main():
         logger.info(f'Saved calibrated checkpoint: {calibrated_path}')
     else:
         logger.error('BN calibration failed — NaN in running stats!')
+
+    # ---- EMA (T2.3): swap in EMA weights, recalibrate BN on the EMA
+    # copy, validate, save separately. The live model is unaffected.
+    if ema_model is not None:
+        logger.info('Swapping in EMA weights for BN recalibration + eval')
+        original_reranker_state = {
+            key: value.clone()
+            for key, value in model.couple_reranker.state_dict().items()
+        }
+        # swa_utils.AveragedModel wraps the averaged weights under
+        # `.module` in a way that matches the original state dict when
+        # loaded back into the live reranker.
+        ema_state = ema_model.module.state_dict()
+        model.couple_reranker.load_state_dict(ema_state)
+        calibrate_reranker_batchnorm(
+            model, train_loader, device, data_config,
+            mask_input_index, label_input_index,
+            calibration_steps=200,
+        )
+        if check_batchnorm_health(model):
+            ema_val_losses, ema_val_metrics = validate(
+                model, val_loader, device, data_config,
+                mask_input_index, label_input_index,
+                max_steps=max(1, steps_per_epoch // 2),
+                k_values_couples=tuple(args.k_values_couples),
+                k_values_tracks=tuple(args.k_values_tracks),
+            )
+            ema_c_at_100 = ema_val_metrics.get('c_at_100_couples', 0.0)
+            logger.info(f'EMA C@100 = {ema_c_at_100:.5f}')
+            ema_path = os.path.join(
+                checkpoints_dir, 'best_model_ema_calibrated.pt',
+            )
+            torch.save(
+                {
+                    'epoch': args.epochs,
+                    'couple_reranker_state_dict':
+                        model.couple_reranker.state_dict(),
+                    'ema_c_at_100': ema_c_at_100,
+                    'ema_val_metrics': ema_val_metrics,
+                    'args': vars(args),
+                },
+                ema_path,
+            )
+            logger.info(f'Saved EMA-calibrated checkpoint: {ema_path}')
+        else:
+            logger.error('EMA BN calibration failed — NaN in running stats')
+        # Restore the live (non-EMA) weights for downstream use.
+        model.couple_reranker.load_state_dict(original_reranker_state)
 
     logger.info(f'Training complete. Best C@100: {best_val_c_at_100:.5f}')
     logger.info(f'Experiment: {experiment_dir}')
