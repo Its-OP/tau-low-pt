@@ -297,6 +297,117 @@ def train_one_epoch(
     return loss_averages, global_batch_count
 
 
+def run_profile(
+    model: torch.nn.Module,
+    train_loader,
+    device: torch.device,
+    data_config,
+    mask_input_index: int,
+    label_input_index: int,
+    num_steps: int,
+    output_dir: str,
+    grad_scaler: torch.amp.GradScaler | None = None,
+    warmup_steps: int = 3,
+    wait_steps: int = 2,
+) -> None:
+    """Run N fwd+bwd batches under torch.profiler, emit trace + table.
+
+    Used to diagnose per-op CPU/CUDA time. Schedule:
+    ``wait`` skips initial steps (lets data loader warm up), ``warmup``
+    runs without recording (primes compilation/caches), ``active`` records
+    ``num_steps`` steps into the trace.
+
+    Args:
+        num_steps: Active recording steps — the number of batches whose
+            ops appear in the trace.
+        output_dir: Target directory for ``profile_trace.json`` (chrome
+            trace) and ``profile_summary.txt`` (top ops by CUDA time).
+        grad_scaler: Optional AMP grad scaler — mirrors ``train_one_epoch``
+            behavior so the profile reflects the real training path.
+    """
+    from torch.profiler import ProfilerActivity, profile, schedule
+
+    os.makedirs(output_dir, exist_ok=True)
+    trace_path = os.path.join(output_dir, 'profile_trace.json')
+    summary_path = os.path.join(output_dir, 'profile_summary.txt')
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == 'cuda':
+        activities.append(ProfilerActivity.CUDA)
+
+    profiler_schedule = schedule(
+        wait=wait_steps, warmup=warmup_steps, active=num_steps, repeat=1,
+    )
+    total_batches_needed = wait_steps + warmup_steps + num_steps
+
+    optimizer = torch.optim.SGD(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-8,
+    )
+
+    model.train()
+
+    logger.info(
+        f'Profiling: wait={wait_steps} warmup={warmup_steps} '
+        f'active={num_steps} → total {total_batches_needed} batches',
+    )
+
+    with profile(
+        activities=activities,
+        schedule=profiler_schedule,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as profiler:
+        batch_count = 0
+        for batch_index, batch in enumerate(train_loader):
+            if batch_count >= total_batches_needed:
+                break
+
+            X = batch[0]
+            inputs = [X[k].to(device) for k in data_config.input_names]
+            inputs = trim_to_max_valid_tracks(inputs, mask_input_index)
+            model_inputs, track_labels = extract_label_from_inputs(
+                inputs, label_input_index,
+            )
+            points, features, lorentz_vectors, mask = model_inputs
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(
+                device.type, enabled=grad_scaler is not None,
+            ):
+                loss_dict = model.compute_loss(
+                    points, features, lorentz_vectors, mask, track_labels,
+                )
+                loss_dict.pop('_scores', None)
+                loss = loss_dict['total_loss']
+
+            if grad_scaler is not None:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            profiler.step()
+            batch_count += 1
+
+    profiler.export_chrome_trace(trace_path)
+    summary = profiler.key_averages().table(
+        sort_by=(
+            'cuda_time_total' if device.type == 'cuda' else 'cpu_time_total'
+        ),
+        row_limit=40,
+    )
+    with open(summary_path, 'w') as summary_file:
+        summary_file.write(summary)
+
+    logger.info(f'Chrome trace written: {trace_path}')
+    logger.info(f'Summary written:      {summary_path}')
+    print(summary)
+
+
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
@@ -379,7 +490,12 @@ def validate(
     return loss_averages, metrics
 
 
-def main():
+def _build_argument_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    Split out from ``main`` so tests can inspect flag defaults and parsing
+    without executing training side effects.
+    """
     parser = argparse.ArgumentParser(
         description='Train TrackPreFilter (Stage 1)',
     )
@@ -529,7 +645,26 @@ def main():
         '--optimizer', type=str, default='adamw', choices=OPTIMIZER_NAMES,
         help='Optimizer to use. SOAP and Muon require --amp disabled.',
     )
+    parser.add_argument(
+        '--profile-steps', type=int, default=0,
+        help=(
+            'If >0, run N training batches under torch.profiler and exit '
+            'without training. Emits chrome trace + summary table.'
+        ),
+    )
+    parser.add_argument(
+        '--profile-output', type=str, default=None,
+        help=(
+            'Directory for profile artifacts. Defaults to experiment dir '
+            'when --profile-steps is set.'
+        ),
+    )
 
+    return parser
+
+
+def main():
+    parser = _build_argument_parser()
     args = parser.parse_args()
     device = torch.device(args.device)
 
@@ -841,6 +976,30 @@ def main():
             f'Resumed from epoch {start_epoch - 1}, '
             f'best_val_loss={best_val_loss:.5f}',
         )
+
+    # Profile-only entry: run N batches under torch.profiler, then exit.
+    # Training checkpoints / tensorboard writes are deliberately skipped —
+    # the run's sole output is the chrome trace + summary table.
+    if args.profile_steps > 0:
+        profile_output_dir = args.profile_output or os.path.join(
+            experiment_dir, 'profile',
+        )
+        logger.info(
+            f'=== Profiling mode: {args.profile_steps} active steps === '
+            f'→ {profile_output_dir}',
+        )
+        run_profile(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            data_config=data_config,
+            mask_input_index=mask_input_index,
+            label_input_index=label_input_index,
+            num_steps=args.profile_steps,
+            output_dir=profile_output_dir,
+            grad_scaler=grad_scaler,
+        )
+        return
 
     logger.info('=== Training ===')
 
