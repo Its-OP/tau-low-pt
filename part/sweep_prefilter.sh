@@ -83,7 +83,6 @@ COMMON_ARGS=(
     --steps-per-epoch "${STEPS_PER_EPOCH}"
     --num-workers "${NUM_WORKERS}"
     --device cuda:0
-    --no-compile
     --save-every 2
     --keep-best-k "${KEEP_BEST_K}"
 )
