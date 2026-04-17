@@ -309,21 +309,33 @@ def run_profile(
     grad_scaler: torch.amp.GradScaler | None = None,
     warmup_steps: int = 3,
     wait_steps: int = 2,
+    record_shapes: bool = False,
+    profile_memory: bool = False,
+    export_chrome_trace: bool = False,
 ) -> None:
-    """Run N fwd+bwd batches under torch.profiler, emit trace + table.
+    """Run N fwd+bwd batches under torch.profiler, emit summary + optional trace.
 
     Used to diagnose per-op CPU/CUDA time. Schedule:
     ``wait`` skips initial steps (lets data loader warm up), ``warmup``
     runs without recording (primes compilation/caches), ``active`` records
     ``num_steps`` steps into the trace.
 
+    Output size guidance (200 active steps, P~1100 tracks, BS=256):
+      - default (shapes+memory off, no trace) → KB summary only
+      - record_shapes=True                   → ~200 MB trace if exported
+      - profile_memory=True                  → ~2-4x size over record_shapes
+      - both + chrome trace                  → multi-GB (fills disk quickly)
+
     Args:
-        num_steps: Active recording steps — the number of batches whose
-            ops appear in the trace.
-        output_dir: Target directory for ``profile_trace.json`` (chrome
-            trace) and ``profile_summary.txt`` (top ops by CUDA time).
-        grad_scaler: Optional AMP grad scaler — mirrors ``train_one_epoch``
-            behavior so the profile reflects the real training path.
+        num_steps: Active recording steps — batches whose ops appear in trace.
+        output_dir: Directory for ``profile_summary.txt`` + optional
+            ``profile_trace.json``.
+        grad_scaler: Optional AMP grad scaler — mirrors ``train_one_epoch``.
+        record_shapes: Record per-op input shapes. Inflates trace size.
+        profile_memory: Record per-op allocations. Inflates further.
+        export_chrome_trace: Dump the full chrome trace JSON. Off by
+            default because the serialized JSON scales with step × op
+            count × shape/memory metadata.
     """
     from torch.profiler import ProfilerActivity, profile, schedule
 
@@ -348,14 +360,16 @@ def run_profile(
 
     logger.info(
         f'Profiling: wait={wait_steps} warmup={warmup_steps} '
-        f'active={num_steps} → total {total_batches_needed} batches',
+        f'active={num_steps} → total {total_batches_needed} batches | '
+        f'shapes={record_shapes} memory={profile_memory} '
+        f'trace={export_chrome_trace}',
     )
 
     with profile(
         activities=activities,
         schedule=profiler_schedule,
-        record_shapes=True,
-        profile_memory=True,
+        record_shapes=record_shapes,
+        profile_memory=profile_memory,
         with_stack=False,
     ) as profiler:
         batch_count = 0
@@ -393,7 +407,9 @@ def run_profile(
             profiler.step()
             batch_count += 1
 
-    profiler.export_chrome_trace(trace_path)
+    if export_chrome_trace:
+        profiler.export_chrome_trace(trace_path)
+        logger.info(f'Chrome trace written: {trace_path}')
     summary = profiler.key_averages().table(
         sort_by=(
             'cuda_time_total' if device.type == 'cuda' else 'cpu_time_total'
@@ -403,7 +419,6 @@ def run_profile(
     with open(summary_path, 'w') as summary_file:
         summary_file.write(summary)
 
-    logger.info(f'Chrome trace written: {trace_path}')
     logger.info(f'Summary written:      {summary_path}')
     print(summary)
 
@@ -657,6 +672,23 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help=(
             'Directory for profile artifacts. Defaults to experiment dir '
             'when --profile-steps is set.'
+        ),
+    )
+    parser.add_argument(
+        '--profile-record-shapes', action='store_true',
+        help='Record per-op input shapes. Inflates trace size.',
+    )
+    parser.add_argument(
+        '--profile-memory', action='store_true',
+        help='Record per-op allocations. Further inflates trace size.',
+    )
+    parser.add_argument(
+        '--profile-chrome-trace', action='store_true',
+        help=(
+            'Export full chrome trace JSON. Off by default — summary '
+            'table is enough for op-level hotspots and keeps outputs '
+            'in the KB range. Enabling with --profile-steps N results '
+            'in trace files that scale roughly linearly with N.'
         ),
     )
 
@@ -998,6 +1030,9 @@ def main():
             num_steps=args.profile_steps,
             output_dir=profile_output_dir,
             grad_scaler=grad_scaler,
+            record_shapes=args.profile_record_shapes,
+            profile_memory=args.profile_memory,
+            export_chrome_trace=args.profile_chrome_trace,
         )
         return
 

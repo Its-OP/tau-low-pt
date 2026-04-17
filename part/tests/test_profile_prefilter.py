@@ -149,8 +149,8 @@ def _make_tiny_loader(num_batches: int = 10, batch_size: int = 2,
     return _WrappedLoader(_BatchedDataset(batches))
 
 
-def test_run_profile_emits_trace_and_summary(tmp_path):
-    """run_profile executes N steps and dumps trace + summary files."""
+def test_run_profile_emits_summary_by_default(tmp_path):
+    """Default (lean) run_profile writes summary only — no chrome trace."""
     import train_prefilter
 
     model = _TinyMockModel()
@@ -171,7 +171,71 @@ def test_run_profile_emits_trace_and_summary(tmp_path):
 
     trace_file = output_dir / 'profile_trace.json'
     summary_file = output_dir / 'profile_summary.txt'
-    assert trace_file.exists(), f'chrome trace not written at {trace_file}'
+    assert not trace_file.exists(), (
+        f'chrome trace written despite export_chrome_trace=False: {trace_file}'
+    )
     assert summary_file.exists(), f'summary not written at {summary_file}'
     summary_content = summary_file.read_text()
     assert 'Name' in summary_content or 'aten::' in summary_content
+
+
+def test_run_profile_emits_chrome_trace_when_requested(tmp_path):
+    """export_chrome_trace=True writes the full chrome trace JSON."""
+    import train_prefilter
+
+    model = _TinyMockModel()
+    loader = _make_tiny_loader(num_batches=10)
+    data_config = _TinyMockDataConfig()
+
+    output_dir = tmp_path / 'profile'
+    train_prefilter.run_profile(
+        model=model,
+        train_loader=loader,
+        device=torch.device('cpu'),
+        data_config=data_config,
+        mask_input_index=3,
+        label_input_index=4,
+        num_steps=3,
+        output_dir=str(output_dir),
+        export_chrome_trace=True,
+    )
+
+    trace_file = output_dir / 'profile_trace.json'
+    summary_file = output_dir / 'profile_summary.txt'
+    assert trace_file.exists(), f'chrome trace not written at {trace_file}'
+    assert summary_file.exists(), f'summary not written at {summary_file}'
+
+
+def test_profile_verbosity_flags_default_off():
+    """--profile-record-shapes / --profile-memory / --profile-chrome-trace
+    all default to False so that ``--profile-steps N`` alone produces the
+    smallest viable output (summary table only)."""
+    import train_prefilter
+
+    parser = train_prefilter._build_argument_parser()
+    args = parser.parse_args([
+        '--data-config', 'x',
+        '--data-dir', 'x',
+        '--network', 'x',
+    ])
+    assert args.profile_record_shapes is False
+    assert args.profile_memory is False
+    assert args.profile_chrome_trace is False
+
+
+def test_profile_verbosity_flags_opt_in():
+    """Opt-in flags flip their bools when passed."""
+    import train_prefilter
+
+    parser = train_prefilter._build_argument_parser()
+    args = parser.parse_args([
+        '--data-config', 'x',
+        '--data-dir', 'x',
+        '--network', 'x',
+        '--profile-record-shapes',
+        '--profile-memory',
+        '--profile-chrome-trace',
+    ])
+    assert args.profile_record_shapes is True
+    assert args.profile_memory is True
+    assert args.profile_chrome_trace is True
