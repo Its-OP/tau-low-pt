@@ -6,7 +6,46 @@ behind each outcome. No next-step recommendations appear in this file.
 
 ---
 
-## 1. Purpose of the task
+## 1. Glossary
+
+- **C@K_couples**: fraction of events (out of **total events seen**)
+  where ≥ 1 GT couple is in the reranker's top-K output.
+- **RC@K_couples**: fraction of events where ≥ 1 GT couple is in the
+  top-K output **and** the full GT triplet is present in Stage 1's
+  top-K1. "RC" = "reachable C".
+- **D@K_tracks**: fraction of events where ≥ 2 GT pions lie in
+  Stage 2's top-K tracks. Property of the frozen cascade; bounds
+  C@K_couples above at K = K2.
+- **mean_first_gt_rank_couples**: mean 1-indexed rank of the
+  highest-ranked GT couple, averaged over eligible events only.
+- **GT couple**: an unordered pair of tracks both of which come from
+  the τ decay. Roughly 3 per event (C(3, 2) = 3 from the three GT
+  pions).
+- **Eligible events**: events with at least one GT couple available in
+  the cascade's top-K2 tracks.
+- **Events with full triplet**: events with all three GT pions in the
+  reranker's output couples (required for the downstream third-pion
+  completion to recover the triplet from the top-K couples).
+- **Train-time val subset**: the first 9 600 events of the val split,
+  consumed unshuffled by the training-script's mid-epoch validator.
+  Systematically reports C@100 ≈ 4 pp higher than the full 52 452-event
+  val.
+- **ΔC@100**: signed difference between a run's best C@100 and a
+  named reference run's best C@100, under the same val split.
+- **gap_closure**: `ΔC@100 / (D@K2 − C@100_baseline)` — fraction of
+  the structural ceiling gap that the experiment closed.
+- **Baseline v1 (pairwise)**: original softplus pairwise ranking loss,
+  full-val C@100 = 0.7881.
+- **Baseline v2 (stacked)**: softmax-CE + label_smoothing=0.10 +
+  cosine_power=2.0, full-val C@100 = 0.7914.
+- **Baseline v3 (projected_infersent)**: baseline v2 plus a learned
+  per-track projector `φ(t) = LayerNorm(ReLU(Linear(16 → 16)(t)))`
+  followed by InferSent-style pair fusion. Full-val C@100 = 0.7915;
+  mean_rank = 10.7. Current project default.
+
+---
+
+## 2. Purpose of the task
 
 The project aims to reconstruct low-transverse-momentum τ → 3π decays at
 CMS. A single event contains O(1000) detector tracks of which exactly
@@ -41,7 +80,7 @@ candidate pool before any ranking can promote it.
 
 ---
 
-## 2. Constraints and design choices locked before the experiments started
+## 3. Constraints and design choices locked before the experiments started
 
 Decisions made earlier in the project. They shape what can and cannot be
 tried at Stage 3:
@@ -89,21 +128,16 @@ tried at Stage 3:
 
 ---
 
-## 3. Starting conditions
+## 4. Starting conditions — original baseline (v1)
 
 Reported under the fixed config `K2 = 60, batch = 96, 60 epochs, 200
 steps/epoch, AdamW lr = 5e-4, weight decay = 0.01, cosine LR schedule
-with 5 % warmup, grad clip = 1.0, seed = 42`. Frozen cascade.
-
-### 3.1 Original baseline (v1) — pairwise softplus loss
-
-`CoupleReranker` as designed in `reports/triplet_reranking/
-triplet_research_plan_20260408.md`. Loss is the softplus pairwise
-ranking loss that the prefilter and Stage-2 reranker also use:
+with 5 % warmup, grad clip = 1.0, seed = 42`. Frozen cascade. Loss is
+the softplus pairwise ranking loss (the same one used by the prefilter
+and Stage-2 reranker):
 $$L = T \cdot \mathrm{softplus}\bigl((s_\mathrm{neg} - s_\mathrm{pos}) / T\bigr),\quad T=1$$
-averaged over 50 random negatives × per-event positive pairs. The input
-feature vector, built by `part/utils/couple_features.py`, has 51
-dimensions:
+averaged over 50 random negatives × per-event positive pairs. The
+per-couple input feature vector has 51 dimensions:
 
 | Block | Dims | Content |
 |---|---|---|
@@ -130,30 +164,9 @@ The train-time-subset-to-full-val gap is ~4 pp, consistent across every
 checkpoint measured. It is a property of the val-subset selection, not
 a metric bug.
 
-### 3.2 Pre-Stage-3 failures (catalogued for non-repetition)
-
-These experiments predate this document's scope but inform what is off
-the table. They were abandoned and are listed here so readers
-understand the design space has been narrowed empirically.
-
-| Scope | Attempt | Outcome | Mechanism |
-|---|---|---|---|
-| Stage 1 | Asymmetric focal loss (ASL) | R@200 fell from 0.66 to 0.41 | Hard clip zeros easy-negative gradients; signal is already at the noise floor and needs every gradient it can get |
-| Stage 1 | Online hard-example mining (OHEM) | R@200 fell to 0.50 | Problem is already maximally hard — 99.7 % of neighbourhoods are noise |
-| Stage 1 | Pairwise Lorentz vectors inside message passing | R@200 fell to 0.24 | Autoencoder latent collapse |
-| Stage 1 | Pairwise features as attention bias | R@200 fell to 0.39 | Same autoencoder collapse as above |
-| Stage 1 | Triplet scoring | OOM | 88 % of kNN pairs survive the mass cut; triplet expansion is intractable |
-| Stage 2 | Boundary sampling (negatives restricted to ranks 150–250) | R@200 fell from 0.676 to 0.60 | Restricting the sampled region destroys the full ranking signal |
-| Stage 2/3 | Combinatorial triplet post-processing with physics cuts | ~120 000 survivors per event | Low-pT physics filters are not selective |
-
-Key takeaway locked in from these: at 0.27 % signal purity, anything
-that restricts the negative distribution or replaces the full ranking
-signal with a clipped surrogate hurts. The CoupleReranker experiments
-respect this.
-
 ---
 
-## 4. Batch 1 sweep — loss, schedule, sampling, architecture at input_dim = 51
+## 5. Batch 1 sweep — loss, schedule, sampling, architecture at input_dim = 51
 
 **Run id:** `couple_improvements_20260416_211532`. 14 experiments, all
 60 epochs, all completed, all knob audits verified against the parsed
@@ -371,7 +384,7 @@ checkpoint; the v1 pairwise checkpoint preserved as
 
 ---
 
-## 5. Batch 2 sweep — couple-embedding redesign and Batch 1 follow-ups
+## 6. Batch 2 sweep — couple-embedding redesign and Batch 1 follow-ups
 
 **Run id:** `couple_batch2_20260417_153112`. 9 experiments, all
 completed (60 epochs each except D1 at 80). All knob audits verified
@@ -615,7 +628,7 @@ auto-configure), rerun in flight.
 
 ---
 
-## 6. Cross-batch summary of what works
+## 7. Cross-batch summary of what works
 
 The Stage-3 couple-reranker work to date has found exactly two
 additive knobs:
@@ -644,7 +657,7 @@ An apparent third winner is under investigation as of the snapshot:
 
 ---
 
-## 7. Cross-batch summary of what does not work, and why
+## 8. Cross-batch summary of what does not work, and why
 
 **Loss-level knobs that do not help:**
 
@@ -696,7 +709,7 @@ An apparent third winner is under investigation as of the snapshot:
 
 ---
 
-## 8. Outstanding questions visible in the data
+## 9. Outstanding questions visible in the data
 
 - **Train-time vs full-val offset of ~4 pp** is consistent across every
   checkpoint and every batch. The train-time subset is the first
@@ -729,7 +742,7 @@ An apparent third winner is under investigation as of the snapshot:
 
 ---
 
-## 9. Experimental infrastructure
+## 10. Experimental infrastructure
 
 For each experiment, the following is preserved:
 
@@ -768,73 +781,3 @@ Audit procedure applied to every experiment, without exception:
 All 14 Batch 1 experiments and all 9 Batch 2 experiments passed this
 audit.
 
----
-
-## 10. Glossary
-
-- **C@K_couples**: fraction of events (out of **total events seen**)
-  where ≥ 1 GT couple is in the reranker's top-K output.
-- **RC@K_couples**: fraction of events where ≥ 1 GT couple is in the
-  top-K output **and** the full GT triplet is present in Stage 1's
-  top-K1. "RC" = "reachable C".
-- **D@K_tracks**: fraction of events where ≥ 2 GT pions lie in
-  Stage 2's top-K tracks. Property of the frozen cascade; bounds
-  C@K_couples above at K = K2.
-- **mean_first_gt_rank_couples**: mean 1-indexed rank of the
-  highest-ranked GT couple, averaged over eligible events only.
-- **GT couple**: an unordered pair of tracks both of which come from
-  the τ decay. Roughly 3 per event (C(3, 2) = 3 from the three GT
-  pions).
-- **Eligible events**: events with at least one GT couple available in
-  the cascade's top-K2 tracks.
-- **Events with full triplet**: events with all three GT pions in the
-  reranker's output couples (required for the downstream third-pion
-  completion to recover the triplet from the top-K couples).
-- **Train-time val subset**: the first 9 600 events of the val split,
-  consumed unshuffled by the training-script's mid-epoch validator.
-  Systematically reports C@100 ≈ 4 pp higher than the full 52 452-event
-  val.
-- **ΔC@100**: signed difference between a run's best C@100 and a
-  named reference run's best C@100, under the same val split.
-- **gap_closure**: `ΔC@100 / (D@K2 − C@100_baseline)` — fraction of
-  the structural ceiling gap that the experiment closed.
-- **Baseline v1 (pairwise)**: original softplus pairwise ranking loss,
-  full-val C@100 = 0.7881.
-- **Baseline v2 (stacked)**: softmax-CE + label_smoothing=0.10 +
-  cosine_power=2.0, full-val C@100 = 0.7914. Current project default.
-
----
-
-## 11. Raw data pointers
-
-Everything referenced above is preserved at the paths below. Every
-checkpoint carries its own `args` dict so a later reader can
-reconstruct the training-time configuration without reading this
-document.
-
-- **Batch 1 artefacts**: `debug_checkpoints/couple_improvements_2026
-  04_16_211532/` (local, gitignored, 124 MB: 14 × best ckpts, per-epoch
-  metric JSONs, training logs, `diagnostics.json`, sweep orchestrator
-  log).
-- **Baseline v2 artefacts**: `debug_checkpoints/baseline_v2_s010_c200/`.
-- **Batch 1 full-val evals**: `debug_checkpoints/full_val_eval_2026
-  04_17_120621/` (parquets not copied locally, ~91 MB each; logs and
-  metrics preserved).
-- **Baseline v2 full-val eval**: `debug_checkpoints/full_val_eval_
-  baseline_v2_133452/`.
-- **Batch 2 run**: server-side
-  `/workspace/tau-low-pt/part/experiments/couple_batch2_20260417_153112/`.
-  Snapshot predates local tarball.
-- **Batch 2 full-val eval**: in progress at snapshot time at
-  `/tmp/batch2_fullval_072546/` on the server.
-- **Live progress tracker** (includes the same tables as this document
-  but with narrative annotations added as runs completed):
-  `part/reports/couple_reranker_improvements_progress.md`.
-- **Sweep orchestrator scripts**:
-  `part/sweep_couple_improvements.sh` (Batch 1),
-  `part/sweep_couple_batch2.sh` (Batch 2).
-- **Training script**: `part/train_couple_reranker.py`. Current
-  defaults reflect baseline v2.
-- **Model code**: `weaver/weaver/nn/model/CoupleReranker.py`,
-  `weaver/weaver/nn/model/CoupleCascadeModel.py`.
-- **Feature builder**: `part/utils/couple_features.py`.
