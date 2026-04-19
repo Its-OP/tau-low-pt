@@ -329,3 +329,15 @@ Explored in the improvement blueprint as an alternative Stage 2 architecture
 using 3 learned queries with cross-attention to all K₁ tracks. Deprioritized
 in favor of the ParT pairwise-bias approach, which directly injects physics
 features as attention bias with simpler training dynamics.
+
+---
+
+### Prefilter improvement campaign (2026-04-16 → 2026-04-19)
+
+17 experiments (E1-E12 + E2a-e RF sweep) across two vast.ai servers. Best
+R@200 in campaign was the 40-epoch E2a (edge + k=16 + r=3) at **0.9227** —
+unchanged from the baseline that opened the campaign. Closest 20-epoch
+config was E2c (edge + k=32 + r=3) at 0.9223. Target C@200 > 0.95 was not
+reached within budget. Infra deliverables: torch.profiler integration,
+`cross_set_gather` rewrite (3 copies → 1, lifted BS=256 k=48 OOM ceiling).
+Full results + autopsy: `reports/prefilter_campaign_20260419_results.md`.
