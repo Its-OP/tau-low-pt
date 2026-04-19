@@ -210,23 +210,25 @@ def cross_set_gather(
     Returns:
         gathered_features: (B, C, M, K) neighbor features for each query.
     """
-    batch_size, num_channels, num_reference_points = reference_features.shape
+    # Single ``torch.gather`` along the reference-point axis. Expanding the
+    # indices across the channel dimension is a stride-0 view — the same
+    # neighbor index is read for every channel, which is exactly the
+    # desired semantics. Output is contiguous (B, C, M*K); the final view
+    # reshapes in place.
+    #
+    # Replaces the earlier transpose → reshape → advanced-index → permute
+    # → contiguous chain which allocated three (B·C·M·K) scratch tensors
+    # per call and OOM'd at k ≥ 48 with BS=256.
+    batch_size, num_channels, _ = reference_features.shape
     _, num_queries, num_neighbors = neighbor_indices.shape
 
-    # Flatten batch indexing: offset indices by batch * P
-    batch_offset = (
-        torch.arange(batch_size, device=reference_features.device)
-        .view(-1, 1, 1) * num_reference_points
-    )  # (B, 1, 1)
-    flat_indices = (neighbor_indices + batch_offset).reshape(-1)  # (B*M*K,)
-
-    # (B, C, P) → (B, P, C) → (B*P, C) → index → (B*M*K, C) → reshape
-    flat_features = reference_features.transpose(1, 2).reshape(-1, num_channels)
-    gathered = flat_features[flat_indices]  # (B*M*K, C)
-    gathered = gathered.view(batch_size, num_queries, num_neighbors, num_channels)
-    gathered = gathered.permute(0, 3, 1, 2).contiguous()  # (B, C, M, K)
-
-    return gathered
+    flat_indices = neighbor_indices.reshape(
+        batch_size, 1, num_queries * num_neighbors,
+    ).expand(batch_size, num_channels, num_queries * num_neighbors)
+    gathered = reference_features.gather(dim=2, index=flat_indices)
+    return gathered.view(
+        batch_size, num_channels, num_queries, num_neighbors,
+    )
 
 
 def build_cross_set_edge_features(

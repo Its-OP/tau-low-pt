@@ -106,6 +106,10 @@ def train_one_epoch(
     mask_input_index: int,
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
+    augmentation: torch.nn.Module | None = None,
+    ema_teacher: torch.nn.Module | None = None,
+    ema_decay: float = 0.999,
+    kl_weight: float = 0.1,
 ) -> tuple[dict[str, float], int]:
     """Train for one epoch."""
     model.train()
@@ -135,6 +139,12 @@ def train_one_epoch(
         )
         points, features, lorentz_vectors, mask = model_inputs
 
+        # Optional set-friendly augmentation (JetCLR-style).
+        if augmentation is not None:
+            points, features, lorentz_vectors, mask = augmentation(
+                points, features, lorentz_vectors, mask, track_labels,
+            )
+
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=grad_scaler is not None):
@@ -148,6 +158,41 @@ def train_one_epoch(
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
             )
+            student_scores = loss_dict.get('_scores')
+
+            # Self-distillation EMA teacher (E12). Teacher runs in eval
+            # mode and no-grad. KL between student and teacher logits
+            # (softened with temperature 1) is added with kl_weight.
+            if ema_teacher is not None and student_scores is not None:
+                with torch.no_grad():
+                    teacher_scores = ema_teacher(
+                        points, features, lorentz_vectors, mask,
+                    )
+                valid_mask = mask.squeeze(1).bool()
+                student_logits = student_scores.masked_fill(
+                    ~valid_mask, float('-inf'),
+                )
+                teacher_logits = teacher_scores.masked_fill(
+                    ~valid_mask, float('-inf'),
+                )
+                student_log_prob = torch.nn.functional.log_softmax(
+                    student_logits, dim=-1,
+                )
+                teacher_prob = torch.nn.functional.softmax(
+                    teacher_logits, dim=-1,
+                )
+                # Per-event KL, averaged over events with at least 1 positive.
+                kl_per_event = torch.nn.functional.kl_div(
+                    student_log_prob, teacher_prob,
+                    reduction='none',
+                )
+                kl_per_event = kl_per_event.sum(dim=-1)
+                kl_loss = kl_per_event.mean()
+                loss_dict['kl_loss'] = kl_loss
+                loss_dict['total_loss'] = loss_dict['total_loss'] + (
+                    kl_weight * kl_loss
+                )
+
             # Remove cached scores (non-scalar) before loss accumulation
             loss_dict.pop('_scores', None)
             loss = loss_dict['total_loss']
@@ -178,6 +223,25 @@ def train_one_epoch(
             grad_scaler.update()
         else:
             optimizer.step()
+
+        # EMA teacher update (E12). θ_teacher ← decay · θ_teacher + (1-decay) · θ_student.
+        if ema_teacher is not None:
+            with torch.no_grad():
+                student_params = dict(model.named_parameters())
+                for name, teacher_param in ema_teacher.named_parameters():
+                    student_param = student_params.get(name)
+                    if student_param is None:
+                        continue
+                    teacher_param.data.mul_(ema_decay).add_(
+                        student_param.data, alpha=1.0 - ema_decay,
+                    )
+                # Buffers (BN running stats) — copy straight through.
+                student_buffers = dict(model.named_buffers())
+                for name, teacher_buffer in ema_teacher.named_buffers():
+                    student_buffer = student_buffers.get(name)
+                    if student_buffer is None:
+                        continue
+                    teacher_buffer.data.copy_(student_buffer.data)
 
         scheduler.step_batch()
 
@@ -231,6 +295,132 @@ def train_one_epoch(
     )
 
     return loss_averages, global_batch_count
+
+
+def run_profile(
+    model: torch.nn.Module,
+    train_loader,
+    device: torch.device,
+    data_config,
+    mask_input_index: int,
+    label_input_index: int,
+    num_steps: int,
+    output_dir: str,
+    grad_scaler: torch.amp.GradScaler | None = None,
+    warmup_steps: int = 3,
+    wait_steps: int = 2,
+    record_shapes: bool = False,
+    profile_memory: bool = False,
+    export_chrome_trace: bool = False,
+) -> None:
+    """Run N fwd+bwd batches under torch.profiler, emit summary + optional trace.
+
+    Used to diagnose per-op CPU/CUDA time. Schedule:
+    ``wait`` skips initial steps (lets data loader warm up), ``warmup``
+    runs without recording (primes compilation/caches), ``active`` records
+    ``num_steps`` steps into the trace.
+
+    Output size guidance (200 active steps, P~1100 tracks, BS=256):
+      - default (shapes+memory off, no trace) → KB summary only
+      - record_shapes=True                   → ~200 MB trace if exported
+      - profile_memory=True                  → ~2-4x size over record_shapes
+      - both + chrome trace                  → multi-GB (fills disk quickly)
+
+    Args:
+        num_steps: Active recording steps — batches whose ops appear in trace.
+        output_dir: Directory for ``profile_summary.txt`` + optional
+            ``profile_trace.json``.
+        grad_scaler: Optional AMP grad scaler — mirrors ``train_one_epoch``.
+        record_shapes: Record per-op input shapes. Inflates trace size.
+        profile_memory: Record per-op allocations. Inflates further.
+        export_chrome_trace: Dump the full chrome trace JSON. Off by
+            default because the serialized JSON scales with step × op
+            count × shape/memory metadata.
+    """
+    from torch.profiler import ProfilerActivity, profile, schedule
+
+    os.makedirs(output_dir, exist_ok=True)
+    trace_path = os.path.join(output_dir, 'profile_trace.json')
+    summary_path = os.path.join(output_dir, 'profile_summary.txt')
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == 'cuda':
+        activities.append(ProfilerActivity.CUDA)
+
+    profiler_schedule = schedule(
+        wait=wait_steps, warmup=warmup_steps, active=num_steps, repeat=1,
+    )
+    total_batches_needed = wait_steps + warmup_steps + num_steps
+
+    optimizer = torch.optim.SGD(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-8,
+    )
+
+    model.train()
+
+    logger.info(
+        f'Profiling: wait={wait_steps} warmup={warmup_steps} '
+        f'active={num_steps} → total {total_batches_needed} batches | '
+        f'shapes={record_shapes} memory={profile_memory} '
+        f'trace={export_chrome_trace}',
+    )
+
+    with profile(
+        activities=activities,
+        schedule=profiler_schedule,
+        record_shapes=record_shapes,
+        profile_memory=profile_memory,
+        with_stack=False,
+    ) as profiler:
+        batch_count = 0
+        for batch_index, batch in enumerate(train_loader):
+            if batch_count >= total_batches_needed:
+                break
+
+            X = batch[0]
+            inputs = [X[k].to(device) for k in data_config.input_names]
+            inputs = trim_to_max_valid_tracks(inputs, mask_input_index)
+            model_inputs, track_labels = extract_label_from_inputs(
+                inputs, label_input_index,
+            )
+            points, features, lorentz_vectors, mask = model_inputs
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(
+                device.type, enabled=grad_scaler is not None,
+            ):
+                loss_dict = model.compute_loss(
+                    points, features, lorentz_vectors, mask, track_labels,
+                )
+                loss_dict.pop('_scores', None)
+                loss = loss_dict['total_loss']
+
+            if grad_scaler is not None:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            profiler.step()
+            batch_count += 1
+
+    if export_chrome_trace:
+        profiler.export_chrome_trace(trace_path)
+        logger.info(f'Chrome trace written: {trace_path}')
+    summary = profiler.key_averages().table(
+        sort_by=(
+            'cuda_time_total' if device.type == 'cuda' else 'cpu_time_total'
+        ),
+        row_limit=40,
+    )
+    with open(summary_path, 'w') as summary_file:
+        summary_file.write(summary)
+
+    logger.info(f'Summary written:      {summary_path}')
+    print(summary)
 
 
 @torch.no_grad()
@@ -315,7 +505,12 @@ def validate(
     return loss_averages, metrics
 
 
-def main():
+def _build_argument_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    Split out from ``main`` so tests can inspect flag defaults and parsing
+    without executing training side effects.
+    """
     parser = argparse.ArgumentParser(
         description='Train TrackPreFilter (Stage 1)',
     )
@@ -341,6 +536,114 @@ def main():
              'Applied after each ReLU in the mlp-mode track_mlp, '
              'neighbor_mlps, and scorer. Set to 0 to disable.',
     )
+    # --- Architecture knobs (prefilter improvement campaign) ---
+    parser.add_argument(
+        '--num-neighbors', type=int, default=16,
+        help='k for k-NN neighbor aggregation (default: 16).',
+    )
+    parser.add_argument(
+        '--num-message-rounds', type=int, default=3,
+        help='Number of k-NN message-passing rounds (default: 3, '
+             'E2a campaign winner). Set to 0 for the '
+             'aggregation-ablation experiment.',
+    )
+    parser.add_argument(
+        '--aggregation-mode', type=str, default='max',
+        choices=['max', 'pna'],
+        help='Neighbor aggregation: max-pool (default) or PNA '
+             '(cat of mean, max, min, std).',
+    )
+    parser.add_argument(
+        '--use-edge-features', action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Append pairwise_lv_fts (ln kT, ln z, ln ΔR, ln m²) '
+             'max-pooled over the k-NN to the aggregation input '
+             '(+4 channels). Default ON (E2a campaign winner); '
+             'pass --no-use-edge-features to disable.',
+    )
+    # --- Loss switch (prefilter improvement campaign) ---
+    parser.add_argument(
+        '--loss-type', type=str, default='pairwise',
+        choices=[
+            'pairwise', 'listwise_ce', 'infonce',
+            'logit_adjust', 'object_condensation', 'mpm_pretrain',
+        ],
+        help='Per-event supervision loss. Default pairwise matches '
+             'the historical TrackPreFilter ranking objective.',
+    )
+    parser.add_argument(
+        '--logit-adjust-tau', type=float, default=1.0,
+        help='τ for Menon 2007.07314 logit adjustment. Only used when '
+             '--loss-type=logit_adjust.',
+    )
+    parser.add_argument(
+        '--listwise-temperature', type=float, default=1.0,
+        help='Temperature for listwise_ce / infonce loss.',
+    )
+    # --- Regularisation / augmentation / SSL ---
+    parser.add_argument(
+        '--use-augmentation', action='store_true',
+        help='Apply set-friendly train-time augmentations '
+             '(track dropout, feature jitter, η-φ rotation).',
+    )
+    parser.add_argument(
+        '--ssl-pretrain-ckpt', type=str, default=None,
+        help='Load backbone weights (track_mlp, neighbor_mlps) from a '
+             'masked-particle-modeling SSL pretrain checkpoint before '
+             'supervised training starts.',
+    )
+    parser.add_argument(
+        '--mpm-pretrain-epochs', type=int, default=0,
+        help='If > 0, run that many epochs of masked-particle-modeling '
+             'pretraining before the supervised phase. Uses the model'
+             "'s track_mlp + neighbor_mlps backbone and a reconstruction "
+             'head to predict the input features of randomly masked tracks.',
+    )
+    parser.add_argument(
+        '--mpm-mask-ratio', type=float, default=0.15,
+        help='Fraction of valid tracks randomly masked during MPM pretrain.',
+    )
+    # --- Self-distillation EMA teacher (E12) ---
+    parser.add_argument(
+        '--use-self-distillation', action='store_true',
+        help='Enable self-distillation: maintain an EMA teacher copy of '
+             'the student, add a KL-divergence loss between their logits.',
+    )
+    parser.add_argument(
+        '--ema-decay', type=float, default=0.999,
+        help='EMA decay for the teacher. Higher = slower teacher.',
+    )
+    parser.add_argument(
+        '--kl-weight', type=float, default=0.1,
+        help='Weight of the KL-divergence auxiliary loss.',
+    )
+    # --- Object condensation head (E5) ---
+    parser.add_argument(
+        '--clustering-dim', type=int, default=8,
+        help='Embedding dim for object-condensation loss (E5). '
+             'Unused unless --loss-type object_condensation.',
+    )
+    parser.add_argument(
+        '--oc-potential-weight', type=float, default=1.0,
+        help='Weight of the OC attractive/repulsive potential term.',
+    )
+    parser.add_argument(
+        '--oc-beta-weight', type=float, default=1.0,
+        help='Weight of the OC β-regulariser term.',
+    )
+    parser.add_argument(
+        '--oc-q-min', type=float, default=0.1,
+        help='Minimum charge floor for object-condensation q values.',
+    )
+    # --- XGBoost stub feature (E7) ---
+    parser.add_argument(
+        '--use-xgb-stub-feature', action='store_true',
+        help='Prepend a frozen linear per-track score (16→1) as a 17th '
+             'feature channel. Stub placeholder for the real XGBoost '
+             'score cache — once the cache exists, replace the stub '
+             'with the pre-computed scores. The flag exists so the '
+             'input-dim path is exercised.',
+    )
     parser.add_argument('--train-fraction', type=float, default=0.8,
                         help='Fraction of data-dir for training (ignored if --val-data-dir set)')
     parser.add_argument('--val-data-dir', type=str, default=None,
@@ -360,7 +663,43 @@ def main():
         '--optimizer', type=str, default='adamw', choices=OPTIMIZER_NAMES,
         help='Optimizer to use. SOAP and Muon require --amp disabled.',
     )
+    parser.add_argument(
+        '--profile-steps', type=int, default=0,
+        help=(
+            'If >0, run N training batches under torch.profiler and exit '
+            'without training. Emits chrome trace + summary table.'
+        ),
+    )
+    parser.add_argument(
+        '--profile-output', type=str, default=None,
+        help=(
+            'Directory for profile artifacts. Defaults to experiment dir '
+            'when --profile-steps is set.'
+        ),
+    )
+    parser.add_argument(
+        '--profile-record-shapes', action='store_true',
+        help='Record per-op input shapes. Inflates trace size.',
+    )
+    parser.add_argument(
+        '--profile-memory', action='store_true',
+        help='Record per-op allocations. Further inflates trace size.',
+    )
+    parser.add_argument(
+        '--profile-chrome-trace', action='store_true',
+        help=(
+            'Export full chrome trace JSON. Off by default — summary '
+            'table is enough for op-level hotspots and keeps outputs '
+            'in the KB range. Enabling with --profile-steps N results '
+            'in trace files that scale roughly linearly with N.'
+        ),
+    )
 
+    return parser
+
+
+def main():
+    parser = _build_argument_parser()
     args = parser.parse_args()
     device = torch.device(args.device)
 
@@ -489,7 +828,60 @@ def main():
     model, model_info = network_module.get_model(
         data_config,
         dropout=args.dropout,
+        num_neighbors=args.num_neighbors,
+        num_message_rounds=args.num_message_rounds,
+        aggregation_mode=args.aggregation_mode,
+        use_edge_features=args.use_edge_features,
+        loss_type=args.loss_type,
+        logit_adjust_tau=args.logit_adjust_tau,
+        listwise_temperature=args.listwise_temperature,
+        use_xgb_stub_feature=args.use_xgb_stub_feature,
+        clustering_dim=args.clustering_dim,
     )
+    # Post-construction scalar attribute tweaks for the OC / MPM flags
+    # that don't change module layout.
+    if hasattr(model, 'module'):
+        model_root = model.module
+    else:
+        model_root = model
+    model_root.oc_q_min = args.oc_q_min
+    model_root.oc_potential_weight = args.oc_potential_weight
+    model_root.oc_beta_weight = args.oc_beta_weight
+    model_root.mpm_mask_ratio = args.mpm_mask_ratio
+    # MPM masking is ON whenever loss_type == 'mpm_pretrain' (combined
+    # with ``self.training`` gate inside _forward_mlp).
+    model_root.apply_mpm_masking = args.loss_type == 'mpm_pretrain'
+
+    # Optional set-friendly training augmentation. Eval/val path is
+    # untouched — augmentation only fires in train mode.
+    if args.use_augmentation:
+        from utils.set_augmentation import SetAugmentation
+        augmentation = SetAugmentation().to(device)
+    else:
+        augmentation = None
+
+    # EMA teacher for self-distillation (E12). Constructed as a second
+    # network_module.get_model call using the same flags; state dict is
+    # copied from the student, gradients frozen, set to eval mode.
+    if args.use_self_distillation:
+        ema_teacher, _ = network_module.get_model(
+            data_config,
+            dropout=args.dropout,
+            num_neighbors=args.num_neighbors,
+            num_message_rounds=args.num_message_rounds,
+            aggregation_mode=args.aggregation_mode,
+            use_edge_features=args.use_edge_features,
+            loss_type=args.loss_type,
+            logit_adjust_tau=args.logit_adjust_tau,
+            listwise_temperature=args.listwise_temperature,
+        )
+        ema_teacher = ema_teacher.to(device)
+        ema_teacher.load_state_dict(model_root.state_dict())
+        for parameter in ema_teacher.parameters():
+            parameter.requires_grad = False
+        ema_teacher.eval()
+    else:
+        ema_teacher = None
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -620,6 +1012,33 @@ def main():
             f'best_val_loss={best_val_loss:.5f}',
         )
 
+    # Profile-only entry: run N batches under torch.profiler, then exit.
+    # Training checkpoints / tensorboard writes are deliberately skipped —
+    # the run's sole output is the chrome trace + summary table.
+    if args.profile_steps > 0:
+        profile_output_dir = args.profile_output or os.path.join(
+            experiment_dir, 'profile',
+        )
+        logger.info(
+            f'=== Profiling mode: {args.profile_steps} active steps === '
+            f'→ {profile_output_dir}',
+        )
+        run_profile(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            data_config=data_config,
+            mask_input_index=mask_input_index,
+            label_input_index=label_input_index,
+            num_steps=args.profile_steps,
+            output_dir=profile_output_dir,
+            grad_scaler=grad_scaler,
+            record_shapes=args.profile_record_shapes,
+            profile_memory=args.profile_memory,
+            export_chrome_trace=args.profile_chrome_trace,
+        )
+        return
+
     logger.info('=== Training ===')
 
     try:
@@ -649,6 +1068,10 @@ def main():
                 tensorboard_writer, global_batch_count,
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
+                augmentation=augmentation,
+                ema_teacher=ema_teacher,
+                ema_decay=args.ema_decay,
+                kl_weight=args.kl_weight,
             )
 
             eval_steps = max(1, steps_per_epoch // 4)

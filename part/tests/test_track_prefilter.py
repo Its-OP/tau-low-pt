@@ -1111,3 +1111,165 @@ class TestDropoutRegularization:
             use_contrastive_denoising=False,
         )
         assert 'denoising_loss' not in loss_dict
+
+
+# ---- Edge features (pairwise LV physics on k-NN edges) ----
+
+class TestEdgeFeatures:
+    """Tests for ``use_edge_features=True`` path — pairwise LV physics.
+
+    The edge augmentation appends the 4 pairwise_lv_fts channels
+    (ln kT, ln z, ln ΔR, ln m²), max-pooled across the k-NN, to the
+    neighbor-aggregated feature vector. When enabled it shifts the
+    neighbor MLP input dim from ``2 * hidden_dim`` to
+    ``2 * hidden_dim + 4`` (or ``5 * hidden_dim + 4`` for PNA).
+    """
+
+    def _first_conv_in_channels(self, model: TrackPreFilter) -> int:
+        first_conv = next(
+            layer for layer in model.neighbor_mlps[0].modules()
+            if isinstance(layer, torch.nn.Conv1d)
+        )
+        return first_conv.in_channels
+
+    def test_neighbor_input_dim_without_edge_features(self):
+        """Baseline: neighbor_input_dim == 2 * hidden_dim."""
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            hidden_dim=64, num_message_rounds=1,
+            use_edge_features=False,
+        )
+        assert self._first_conv_in_channels(model) == 2 * 64
+
+    def test_neighbor_input_dim_with_edge_features(self):
+        """Edge features add 4 channels (ln kT, ln z, ln ΔR, ln m²)."""
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            hidden_dim=64, num_message_rounds=1,
+            use_edge_features=True,
+        )
+        assert self._first_conv_in_channels(model) == 2 * 64 + 4
+
+    def test_pna_with_edge_features_dim(self):
+        """PNA + edge features: neighbor_input_dim == 5 * hidden_dim + 4."""
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            hidden_dim=64, num_message_rounds=1,
+            aggregation_mode='pna', use_edge_features=True,
+        )
+        assert self._first_conv_in_channels(model) == 5 * 64 + 4
+
+    def test_forward_shape_with_edge_features(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=2, use_edge_features=True,
+        )
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        scores = model(points, features, lorentz_vectors, mask)
+        assert scores.shape == (BATCH_SIZE, NUM_TRACKS)
+
+    def test_scores_finite_with_edge_features(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=2, use_edge_features=True,
+        )
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        scores = model(points, features, lorentz_vectors, mask)
+        valid = mask.squeeze(1).bool()
+        assert torch.isfinite(scores[valid]).all()
+
+    def test_gradients_with_edge_features(self):
+        """Edge path must backprop cleanly into ``features``.
+        pairwise_lv_fts is detached inside build_cross_set_edge_features,
+        so the LV gradient path is intentionally cut. features gradient
+        still flows through the track_mlp / neighbor_mlps path."""
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, use_edge_features=True,
+        )
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        features = features.clone().requires_grad_(True)
+        scores = model(points, features, lorentz_vectors, mask)
+        valid = mask.squeeze(1).bool()
+        scores[valid].sum().backward()
+        assert features.grad is not None
+        assert torch.isfinite(features.grad).all()
+
+    def test_edge_features_changes_output(self):
+        """Enabling edge features should change the output vs. baseline."""
+        torch.manual_seed(0)
+        model_baseline = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, use_edge_features=False,
+        )
+        torch.manual_seed(0)
+        model_edge = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, use_edge_features=True,
+        )
+        model_baseline.eval()
+        model_edge.eval()
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        scores_baseline = model_baseline(
+            points, features, lorentz_vectors, mask,
+        )
+        scores_edge = model_edge(points, features, lorentz_vectors, mask)
+        valid = mask.squeeze(1).bool()
+        # At least some tracks should produce different scores
+        assert not torch.allclose(
+            scores_baseline[valid], scores_edge[valid], atol=1e-5,
+        )
+
+
+class TestDeferredExperiments:
+    """Smoke-level coverage for E5, E7, E10, E12 wiring."""
+
+    def test_xgb_stub_feature_path(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, use_xgb_stub_feature=True,
+        )
+        assert hasattr(model, 'xgb_stub')
+        assert hasattr(model, 'track_mlp_with_xgb')
+        points, features, lorentz_vectors, mask, _ = _make_training_inputs()
+        scores = model(points, features, lorentz_vectors, mask)
+        assert scores.shape == (BATCH_SIZE, NUM_TRACKS)
+        assert torch.isfinite(
+            scores[mask.squeeze(1).bool()],
+        ).all()
+
+    def test_object_condensation_forward_and_loss(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, loss_type='object_condensation',
+        )
+        assert hasattr(model, 'oc_beta_head')
+        assert hasattr(model, 'oc_embedding_head')
+        points, features, lorentz_vectors, mask, track_labels = (
+            _make_training_inputs()
+        )
+        model.train()
+        loss_dict = model.compute_loss(
+            points, features, lorentz_vectors, mask, track_labels,
+            use_contrastive_denoising=False,
+        )
+        assert torch.isfinite(loss_dict['ranking_loss'])
+        assert torch.isfinite(loss_dict['total_loss'])
+
+    def test_mpm_pretrain_loss_is_finite(self):
+        model = TrackPreFilter(
+            mode='mlp', input_dim=INPUT_DIM,
+            num_message_rounds=1, loss_type='mpm_pretrain',
+        )
+        assert hasattr(model, 'mpm_reconstruction_head')
+        model.apply_mpm_masking = True
+        points, features, lorentz_vectors, mask, track_labels = (
+            _make_training_inputs()
+        )
+        model.train()
+        loss_dict = model.compute_loss(
+            points, features, lorentz_vectors, mask, track_labels,
+            use_contrastive_denoising=False,
+        )
+        assert torch.isfinite(loss_dict['ranking_loss'])
+        assert loss_dict['ranking_loss'].item() >= 0.0

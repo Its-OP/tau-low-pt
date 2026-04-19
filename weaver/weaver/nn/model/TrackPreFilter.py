@@ -61,6 +61,12 @@ class TrackPreFilter(nn.Module):
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
         dropout: float = 0.0,
+        use_edge_features: bool = False,
+        loss_type: str = 'pairwise',
+        logit_adjust_tau: float = 1.0,
+        listwise_temperature: float = 1.0,
+        use_xgb_stub_feature: bool = False,
+        clustering_dim: int = 8,
     ):
         super().__init__()
         self.mode = mode
@@ -98,6 +104,41 @@ class TrackPreFilter(nn.Module):
         # PNA multi-aggregation (Corso et al., NeurIPS 2020):
         # 'max' = standard max-pool, 'pna' = cat([mean, max, min, std])
         self.aggregation_mode = aggregation_mode
+
+        # Pairwise LV edge features on k-NN edges (ParT-style).
+        # When True, each message round appends max-pooled pairwise_lv_fts
+        # (4 channels: ln kT, ln z, ln ΔR, ln m²) to the neighbor aggregation.
+        # Requires lorentz_vectors to be supplied to forward().
+        self.use_edge_features = use_edge_features
+        self.edge_feature_dim = 4 if use_edge_features else 0
+
+        # Supervision loss dispatcher — consumed by ``_ranking_loss``.
+        #   'pairwise'            — legacy softplus pairwise ranking (default)
+        #   'listwise_ce'         — event-wise softmax cross-entropy
+        #   'infonce'             — InfoNCE with in-event hard negatives
+        #   'logit_adjust'        — pairwise with Menon 2007.07314 offset
+        #   'object_condensation' — Kieseler 2002.03605 attractive/repulsive
+        #   'mpm_pretrain'        — masked-particle-modeling SSL pretrain
+        self.loss_type = loss_type
+        self.logit_adjust_tau = logit_adjust_tau
+        self.listwise_temperature = listwise_temperature
+        # Object-condensation + MPM parameters. Populated via attribute
+        # setters from the training script (so the values track CLI flags
+        # without adding 6 more __init__ kwargs).
+        self.clustering_dim: int = clustering_dim
+        self.oc_q_min: float = 0.1
+        self.oc_potential_weight: float = 1.0
+        self.oc_beta_weight: float = 1.0
+        self.mpm_mask_ratio: float = 0.15
+        self._oc_cache: dict[str, torch.Tensor] | None = None
+        # When True, ``_forward_mlp`` routes features through the
+        # xgb_stub + augmented track_mlp path (E7).
+        self.use_xgb_stub_feature: bool = use_xgb_stub_feature
+        # When True, the forward pass applies MPM-style random token
+        # masking to the input features before track_mlp. Activated
+        # during MPM pretraining by the training script.
+        self.apply_mpm_masking: bool = False
+        self._mpm_cache: dict[str, torch.Tensor] | None = None
 
         # Equalized focal weighting (Li et al., CVPR 2022):
         # 0.0 = disabled, >0 = smooth (1-p)^γ modulation on pairwise loss.
@@ -160,6 +201,9 @@ class TrackPreFilter(nn.Module):
             else:
                 # Standard: cat([current, max_pooled]) = 2 * hidden_dim
                 neighbor_input_dim = 2 * hidden_dim
+            # Edge-feature augmentation adds 4 pairwise_lv_fts channels
+            # (ln kT, ln z, ln ΔR, ln m²), max-pooled across the k-NN.
+            neighbor_input_dim += self.edge_feature_dim
 
             def _build_neighbor_mlp() -> nn.Sequential:
                 layers: list[nn.Module] = [
@@ -193,6 +237,55 @@ class TrackPreFilter(nn.Module):
                 scorer_layers.append(nn.Dropout(p=dropout))
             scorer_layers.append(nn.Conv1d(hidden_dim, 1, kernel_size=1))
             self.scorer = nn.Sequential(*scorer_layers)
+
+            # --- Object-condensation heads (E5, Kieseler 2002.03605) ---
+            # Only constructed when the loss type requires them — keeps
+            # the baseline param count unchanged for backward-compatible
+            # checkpoints and preserves existing test assumptions.
+            if loss_type == 'object_condensation':
+                self.oc_beta_head = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+                self.oc_embedding_head = nn.Conv1d(
+                    hidden_dim, self.clustering_dim, kernel_size=1,
+                )
+
+            # --- MPM reconstruction head (E10, Heinrich 2401.13537) ---
+            if loss_type == 'mpm_pretrain':
+                self.mpm_reconstruction_head = nn.Conv1d(
+                    hidden_dim, input_dim, kernel_size=1,
+                )
+
+            # --- XGBoost stub feature track_mlp (E7) ---
+            # Constructed only when the feature is active. Frozen linear
+            # stub stands in for a pre-trained XGBoost per-track score
+            # until a real score cache is wired up.
+            if use_xgb_stub_feature:
+                self.xgb_stub = nn.Conv1d(
+                    input_dim, 1, kernel_size=1, bias=True,
+                )
+                for parameter in self.xgb_stub.parameters():
+                    parameter.requires_grad = False
+                track_mlp_with_xgb_layers: list[nn.Module] = [
+                    nn.Conv1d(
+                        input_dim + 1, hidden_dim,
+                        kernel_size=1, bias=False,
+                    ),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                ]
+                if use_dropout:
+                    track_mlp_with_xgb_layers.append(nn.Dropout(p=dropout))
+                track_mlp_with_xgb_layers += [
+                    nn.Conv1d(
+                        hidden_dim, hidden_dim, kernel_size=1, bias=False,
+                    ),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                ]
+                if use_dropout:
+                    track_mlp_with_xgb_layers.append(nn.Dropout(p=dropout))
+                self.track_mlp_with_xgb = nn.Sequential(
+                    *track_mlp_with_xgb_layers,
+                )
 
         elif mode == 'two_tower':
             # Track tower
@@ -319,7 +412,7 @@ class TrackPreFilter(nn.Module):
             self._lorentz_cache = lorentz_vectors
 
         if self.mode == 'mlp':
-            scores = self._forward_mlp(points, features, mask)
+            scores = self._forward_mlp(points, features, lorentz_vectors, mask)
         elif self.mode == 'two_tower':
             scores = self._forward_two_tower(features, mask)
         elif self.mode == 'autoencoder':
@@ -386,13 +479,42 @@ class TrackPreFilter(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Mode A: Per-track MLP with multi-round kNN neighborhood context."""
+        """Mode A: Per-track MLP with multi-round kNN neighborhood context.
+
+        When ``self.use_edge_features`` is True, each message round
+        also gathers the neighbors' 4-vectors and appends the 4 pairwise
+        LV features (ln kT, ln z, ln ΔR, ln m²), max-pooled over the
+        k-NN, to the aggregation. The LV path is detached (see
+        ``build_cross_set_edge_features``) to avoid √(ΔR²) backward NaNs.
+        """
         mask_float = mask.float()
 
-        # Per-track embedding
-        track_embedding = self.track_mlp(features) * mask_float  # (B, H, P)
+        # Optional MPM masking: zero a random subset of valid tracks'
+        # features. Stored mask is used later to compute MSE only on
+        # masked positions.
+        mpm_masked_positions: torch.Tensor | None = None
+        if self.apply_mpm_masking and self.training:
+            original_features = features
+            with torch.no_grad():
+                random_uniform = torch.rand_like(features[:, :1])  # (B, 1, P)
+                mpm_masked_positions = (
+                    (random_uniform < self.mpm_mask_ratio) & (mask > 0.5)
+                )
+            features = torch.where(
+                mpm_masked_positions, torch.zeros_like(features), features,
+            )
+
+        # Per-track embedding — route through xgb_stub augmented MLP when
+        # requested, else the canonical track_mlp.
+        if self.use_xgb_stub_feature:
+            xgb_score = self.xgb_stub(features)  # (B, 1, P)
+            augmented = torch.cat([features, xgb_score], dim=1)
+            track_embedding = self.track_mlp_with_xgb(augmented) * mask_float
+        else:
+            track_embedding = self.track_mlp(features) * mask_float  # (B, H, P)
 
         # kNN indices in (eta, phi), computed once and reused across rounds
         with torch.no_grad():
@@ -403,6 +525,16 @@ class TrackPreFilter(nn.Module):
                 reference_mask=mask,
                 query_reference_indices=None,
             )
+
+        # Edge features — computed once per forward since only dependent
+        # on the kNN graph + Lorentz vectors, not on the evolving
+        # embedding. Max-pooled across K to produce a (B, 4, P) tensor.
+        if self.use_edge_features:
+            edge_max_pooled = self._compute_edge_max_pooled(
+                lorentz_vectors, mask_float, neighbor_indices,
+            )
+        else:
+            edge_max_pooled = None
 
         # Multi-round message passing
         current = track_embedding
@@ -431,11 +563,89 @@ class TrackPreFilter(nn.Module):
                 )
                 aggregated = torch.cat([current, max_pooled], dim=1)
 
+            if edge_max_pooled is not None:
+                aggregated = torch.cat([aggregated, edge_max_pooled], dim=1)
+
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
-        # Score
+        # Cache the final per-track embedding for downstream loss heads
+        # (OC, MPM reconstruction). Small overhead; only read when the
+        # corresponding loss_type is active.
+        if self.loss_type == 'object_condensation':
+            oc_embedding = self.oc_embedding_head(current) * mask_float
+            oc_beta_logit = self.oc_beta_head(current).squeeze(1)  # (B, P)
+            oc_beta = torch.sigmoid(oc_beta_logit)
+            self._oc_cache = {
+                'embedding': oc_embedding,
+                'beta': oc_beta,
+            }
+            # Ranking score at inference = β. Monotonic, feeds cleanly
+            # into the existing top-K selection.
+            return oc_beta_logit
+
+        if self.loss_type == 'mpm_pretrain' and mpm_masked_positions is not None:
+            reconstruction = self.mpm_reconstruction_head(current) * mask_float
+            self._mpm_cache = {
+                'reconstruction': reconstruction,
+                'original': original_features,
+                'masked_positions': mpm_masked_positions,
+            }
+
+        # Default scoring head
         scores = self.scorer(current).squeeze(1)  # (B, P)
         return scores
+
+    def _compute_edge_max_pooled(
+        self,
+        lorentz_vectors: torch.Tensor,
+        mask_float: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pairwise LV features, max-pooled across the k-NN.
+
+        Math (per edge (i, j) between centroid i and neighbor j):
+            ln ΔR = 0.5 · ln( (η_i − η_j)² + Δφ(φ_i, φ_j)² )
+            ln kT = ln( min(pT_i, pT_j) · ΔR )
+            ln z  = ln( min(pT_i, pT_j) / (pT_i + pT_j) )
+            ln m² = ln( (E_i + E_j)² − ‖p_i + p_j‖² )
+
+        These 4 features are computed with amp disabled and the LV
+        tensors detached, to avoid the 1/√ΔR² backward blow-up that
+        hits nearly-collinear edges. After pooling over the k
+        neighbors, the result is a (B, 4, P) tensor that can be
+        appended to the round-level aggregation input.
+        """
+        from weaver.nn.model.ParticleTransformer import pairwise_lv_fts
+
+        # Gather neighbor 4-vectors: (B, 4, P, K)
+        neighbor_lorentz_vectors = cross_set_gather(
+            lorentz_vectors, neighbor_indices,
+        )
+        neighbor_validity = cross_set_gather(
+            mask_float, neighbor_indices,
+        )
+
+        center_lorentz_expanded = lorentz_vectors.unsqueeze(-1).expand_as(
+            neighbor_lorentz_vectors,
+        )
+        # Autocast off + detach + float32: same recipe as
+        # build_cross_set_edge_features in HierarchicalGraphBackbone.
+        with torch.amp.autocast('cuda', enabled=False):
+            lv_features = pairwise_lv_fts(
+                center_lorentz_expanded.detach().float(),
+                neighbor_lorentz_vectors.detach().float(),
+                num_outputs=4,
+            )  # (B, 4, P, K), float32
+        lv_features = lv_features.to(lorentz_vectors.dtype)
+        # Mask invalid neighbors with -inf so max-pool ignores them
+        lv_features = lv_features.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+        lv_max_pooled = lv_features.max(dim=-1)[0]
+        lv_max_pooled = lv_max_pooled.masked_fill(
+            lv_max_pooled == float('-inf'), 0.0,
+        )
+        return lv_max_pooled  # (B, 4, P)
 
     def _forward_two_tower(
         self,
@@ -625,24 +835,65 @@ class TrackPreFilter(nn.Module):
         labels: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Temperature-scaled pairwise ranking loss optimized for recall@K.
+        """Dispatches to the configured supervision loss.
 
-        For each GT pion, sample S negatives and penalize negatives
-        scoring above positives:
-            L = T * softplus((s_neg - s_pos) / T)
-
-        At T=1.0, this reduces to standard softplus(s_neg - s_pos).
-        High T smooths gradients across more pairs; low T sharpens
-        focus on hard violations near the decision boundary.
-
-        When DRW is active, the loss is scaled by drw_positive_weight
-        to upweight the rare positive class.
-
-        # TODO: Vectorize this loop across the batch using padded positives
-        # and a single torch.randint call. The per-event loop is kept for now
-        # because the main cost savings come from the vectorized contrastive
-        # denoising loss (Opt 2), and this loop operates on tiny tensors.
+        ``self.loss_type`` picks the objective:
+            - ``'pairwise'`` (default) — temperature-scaled softplus
+              pairwise ranking. Math: ``L = T · softplus((s_neg − s_pos) / T)``.
+            - ``'listwise_ce'`` — event-wise softmax cross-entropy.
+            - ``'infonce'`` — InfoNCE per positive anchor.
+            - ``'logit_adjust'`` — pairwise with Menon 2007.07314 offset
+              added to negative logits during training only.
+            - ``'object_condensation'`` — must be handled by the caller
+              because it needs embedding + β outputs, not just scores.
         """
+        from weaver.nn.model.prefilter_losses import (
+            infonce_in_event,
+            listwise_ce_loss,
+            logit_adjust_offset,
+            object_condensation_loss,
+        )
+
+        if self.loss_type == 'listwise_ce':
+            return listwise_ce_loss(
+                scores, labels, valid_mask,
+                temperature=self.listwise_temperature,
+            )
+        if self.loss_type == 'infonce':
+            return infonce_in_event(
+                scores, labels, valid_mask,
+                temperature=self.listwise_temperature,
+            )
+        if self.loss_type == 'object_condensation':
+            if self._oc_cache is None:
+                raise RuntimeError(
+                    'object_condensation loss requires forward() to populate '
+                    'self._oc_cache first.'
+                )
+            embedding = self._oc_cache['embedding']
+            beta = self._oc_cache['beta']
+            return object_condensation_loss(
+                embedding, beta, labels, valid_mask,
+                q_min=self.oc_q_min,
+                potential_weight=self.oc_potential_weight,
+                beta_weight=self.oc_beta_weight,
+            )
+        if self.loss_type == 'mpm_pretrain':
+            if self._mpm_cache is None:
+                # No masked positions for this batch (e.g. eval mode).
+                return torch.zeros(
+                    (), device=scores.device, dtype=scores.dtype,
+                    requires_grad=True,
+                )
+            reconstruction = self._mpm_cache['reconstruction']
+            original = self._mpm_cache['original']
+            masked_positions = self._mpm_cache['masked_positions']
+            # MSE on masked positions only, averaged over masked slots × channels.
+            masked_positions_float = masked_positions.float()
+            squared_error = (reconstruction - original).pow(2) * masked_positions_float
+            denominator = masked_positions_float.sum().clamp_min(1.0) * original.shape[1]
+            return squared_error.sum() / denominator
+
         batch_size = scores.shape[0]
         temperature = self.current_ranking_temperature
         event_losses = []
@@ -671,6 +922,19 @@ class TrackPreFilter(nn.Module):
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
+
+            # Menon 2007.07314 logit adjustment: add τ·log(π_neg/π_pos) to
+            # negative logits during training only. π estimated from this
+            # event's valid counts. Exposes "balanced-error" optimality on
+            # the extreme-imbalance regime (3 / ~1100).
+            if self.loss_type == 'logit_adjust':
+                offset = logit_adjust_offset(
+                    num_positives=len(positive_indices),
+                    num_negatives=len(negative_indices),
+                    tau=self.logit_adjust_tau,
+                )
+                if offset != 0.0:
+                    negative_scores = negative_scores + offset
 
             # L = T × log(1 + exp((s_neg - s_pos) / T))
             # At T=1: standard softplus. At T>1: smoother. At T<1: sharper.
