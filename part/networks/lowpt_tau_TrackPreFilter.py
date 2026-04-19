@@ -40,9 +40,11 @@ def get_model(data_config, **kwargs):
         input_dim=input_dim,
         hidden_dim=kwargs.pop('hidden_dim', 256),
         num_neighbors=kwargs.pop('num_neighbors', 16),
-        num_message_rounds=kwargs.pop('num_message_rounds', 2),
+        # E2a winning config (prefilter_campaign_20260419): k=16, r=3,
+        # edge features ON. Baseline R@200 bump 0.9166 → 0.9227.
+        num_message_rounds=kwargs.pop('num_message_rounds', 3),
         aggregation_mode=kwargs.pop('aggregation_mode', 'max'),
-        use_edge_features=kwargs.pop('use_edge_features', False),
+        use_edge_features=kwargs.pop('use_edge_features', True),
         loss_type=kwargs.pop('loss_type', 'pairwise'),
         logit_adjust_tau=kwargs.pop('logit_adjust_tau', 1.0),
         listwise_temperature=kwargs.pop('listwise_temperature', 1.0),

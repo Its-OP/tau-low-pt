@@ -94,8 +94,11 @@ fi
 # Each experiment is a bash array of extra args appended after COMMON_ARGS.
 # The key is the experiment ID used on the CLI and in filenames.
 declare -A EXPERIMENTS=(
-    [BASELINE]=""
-    [E1]="--use-edge-features"
+    # Defaults (post-campaign): edge features ON, r=3. BASELINE / E8
+    # pass --no-use-edge-features / --num-message-rounds 0 respectively
+    # to restore the pre-campaign comparison point.
+    [BASELINE]="--no-use-edge-features --num-message-rounds 2"
+    [E1]="--use-edge-features --num-message-rounds 2"
     [E2a]="--use-edge-features --num-neighbors 16 --num-message-rounds 3"
     [E2b]="--use-edge-features --num-neighbors 32 --num-message-rounds 2"
     [E2c]="--use-edge-features --num-neighbors 32 --num-message-rounds 3"

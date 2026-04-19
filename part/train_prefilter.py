@@ -542,9 +542,10 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help='k for k-NN neighbor aggregation (default: 16).',
     )
     parser.add_argument(
-        '--num-message-rounds', type=int, default=2,
-        help='Number of k-NN message-passing rounds (default: 2). '
-             'Set to 0 for the aggregation-ablation experiment.',
+        '--num-message-rounds', type=int, default=3,
+        help='Number of k-NN message-passing rounds (default: 3, '
+             'E2a campaign winner). Set to 0 for the '
+             'aggregation-ablation experiment.',
     )
     parser.add_argument(
         '--aggregation-mode', type=str, default='max',
@@ -553,10 +554,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
              '(cat of mean, max, min, std).',
     )
     parser.add_argument(
-        '--use-edge-features', action='store_true',
+        '--use-edge-features', action=argparse.BooleanOptionalAction,
+        default=True,
         help='Append pairwise_lv_fts (ln kT, ln z, ln ΔR, ln m²) '
              'max-pooled over the k-NN to the aggregation input '
-             '(+4 channels).',
+             '(+4 channels). Default ON (E2a campaign winner); '
+             'pass --no-use-edge-features to disable.',
     )
     # --- Loss switch (prefilter improvement campaign) ---
     parser.add_argument(
