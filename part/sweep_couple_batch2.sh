@@ -1,48 +1,39 @@
 #!/bin/bash
 # =============================================================================
-# Couple-reranker improvement sweep (sequential).
+# Couple-reranker improvement sweep — Batch 2.
 #
-# Runs every experiment from
-# `part/reports/couple-reranker-improvements.md` on a single GPU, one
-# after the other. All experiments share the same baseline data /
-# architecture; each one toggles a single feature flag (or stacks a few)
-# so we can attribute gains to specific changes.
+# Builds on Batch 1 (completed 2026-04-17). All experiments run on top of
+# the new baseline v2 (softmax-ce + label_smoothing=0.10 + cosine_power=2.0,
+# which are now the CLI defaults in `train_couple_reranker.py`).
 #
-# NOTE (2026-04-17): The training-script CLI defaults are now the
-# "baseline v2" config (--couple-loss softmax-ce,
-# --couple-label-smoothing 0.10, --cosine-power 2.0). Experiment rows
-# below that explicitly re-set those flags are redundant after the
-# default change — kept for reproducibility of the original sweep. Next
-# sweep should redesign experiments against baseline v2.
-#
-# By default the sweep self-relaunches in a detached `screen` session so
-# it survives SSH disconnects. Set NO_SCREEN=1 to run inline.
+# Focus: pluggable couple-embedding block (A1-A5), clean reads of Batch 1
+# confounded results (B1), hardneg repair (C1), and an extended-epochs
+# sanity check (D1).
 #
 # Usage:
-#   bash sweep_couple_improvements.sh                   # full overnight run (screen)
-#   SMOKE_MODE=1 bash sweep_couple_improvements.sh      # 1-epoch smoke (screen)
-#   NO_SCREEN=1 bash sweep_couple_improvements.sh       # run inline (debugging)
-#   EXPERIMENTS="T0_baseline T1_1_listmle" bash ...     # subset
+#   bash sweep_couple_batch2.sh                   # full run (detached screen)
+#   SMOKE_MODE=1 bash sweep_couple_batch2.sh      # 1-epoch smoke
+#   NO_SCREEN=1 bash sweep_couple_batch2.sh       # run inline
+#   EXPERIMENTS="A1_infersent C1_hardneg_025_m0" bash ...  # subset
 #
-# Reattach a detached sweep:
-#   screen -r couple_sweep
-# Kill a detached sweep:
-#   screen -S couple_sweep -X quit
+# Reattach detached sweep:
+#   screen -r couple_batch2
+# Kill:
+#   screen -S couple_batch2 -X quit
 #
 # Outputs:
-#   experiments/couple_improvements_{smoke_,}<timestamp>/
+#   experiments/couple_batch2_{smoke_,}<timestamp>/
 #     <experiment_name>/
 #       training.log
 #       metrics/epoch_<N>.json
 #       loss_history.json
 #       checkpoints/best_model_calibrated.pt
 #     sweep.log
-#     sweep_summary.json
 # =============================================================================
 set -euo pipefail
 
 SMOKE_MODE="${SMOKE_MODE:-0}"
-SESSION_NAME="${SESSION_NAME:-couple_sweep}"
+SESSION_NAME="${SESSION_NAME:-couple_batch2}"
 
 # ---- Self-relaunch in detached screen (unless we're already inside
 # screen or the caller set NO_SCREEN=1). STY is set by screen for its
@@ -59,7 +50,6 @@ if [ -z "${STY:-}" ] && [ "${NO_SCREEN:-0}" != "1" ]; then
         exit 1
     fi
 
-    # Forward relevant env vars so the child sees the same config.
     CHILD_ENV=""
     for var in SMOKE_MODE EPOCHS STEPS_PER_EPOCH BATCH_SIZE NUM_WORKERS \
                KEEP_BEST_K BN_CALIBRATION_STEPS TOP_K2 SEED DEVICE \
@@ -82,6 +72,20 @@ if [ -z "${STY:-}" ] && [ "${NO_SCREEN:-0}" != "1" ]; then
     exit 0
 fi
 
+# ---- Resolve python interpreter ----
+# SSH-launched screens do not auto-activate conda, so rely on an absolute
+# path to the `part` env's python. Overridable via PYTHON env var.
+PYTHON="${PYTHON:-/venv/part/bin/python}"
+if [ ! -x "${PYTHON}" ]; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON="$(command -v python)"
+    else
+        echo "ERROR: python not found (tried ${PYTHON} and PATH)" >&2
+        exit 1
+    fi
+fi
+echo "Using python: ${PYTHON}"
+
 # ---- Common training config (overridable via env vars) ----
 DATA_CONFIG="${DATA_CONFIG:-data/low-pt/lowpt_tau_trackfinder.yaml}"
 DATA_DIR="${DATA_DIR:-data/low-pt/train/}"
@@ -98,15 +102,11 @@ if [ "${SMOKE_MODE}" = "1" ]; then
     EPOCHS="${EPOCHS:-1}"
     STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-3}"
     BATCH_SIZE="${BATCH_SIZE:-16}"
-    # Smoke uses --no-in-memory + a couple of workers so we skip the
-    # ~160 s in-memory preload of 10 train + 7 val parquets. With just
-    # 3 steps of 16 events we touch a tiny slice of the dataset;
-    # streaming is cheaper than preload.
     NUM_WORKERS="${NUM_WORKERS:-2}"
     NO_IN_MEMORY="${NO_IN_MEMORY:-1}"
     KEEP_BEST_K="${KEEP_BEST_K:-1}"
     BN_CALIBRATION_STEPS="${BN_CALIBRATION_STEPS:-0}"
-    SWEEP_ROOT_PREFIX="couple_improvements_smoke"
+    SWEEP_ROOT_PREFIX="couple_batch2_smoke"
 else
     EPOCHS="${EPOCHS:-60}"
     STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
@@ -115,7 +115,7 @@ else
     NO_IN_MEMORY="${NO_IN_MEMORY:-0}"
     KEEP_BEST_K="${KEEP_BEST_K:-3}"
     BN_CALIBRATION_STEPS="${BN_CALIBRATION_STEPS:-200}"
-    SWEEP_ROOT_PREFIX="couple_improvements"
+    SWEEP_ROOT_PREFIX="couple_batch2"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,25 +127,21 @@ exec > >(tee -a "${SWEEP_LOG}") 2>&1
 
 # ---- Experiment list: "name|extra flags" ----
 #
-# Flat list, one experiment per line. The sweep analyser picks winners
-# tier-by-tier post-hoc; stacking decisions are NOT made inside this
-# script. If you want to run a handpicked subset, pass the
-# EXPERIMENTS env var.
+# Each row toggles a single feature on top of the new baseline v2 defaults
+# (softmax-ce + smoothing=0.10 + cos=2.0). B0_baseline_v2 is included as
+# the reference anchor — running with no extra flags reproduces baseline v2
+# under the identical sweep harness (same seed, same val subset, same BN
+# calibration) so ΔC@100 comparisons are not confounded by harness drift.
 declare -a ALL_EXPERIMENTS=(
-    "T0_baseline|"
-    "T1_1_listmle|--couple-loss softmax-ce"
-    "T1_2_temp_025|--couple-loss softmax-ce --couple-ranking-temperature 0.25"
-    "T1_2_temp_050|--couple-loss softmax-ce --couple-ranking-temperature 0.5"
-    "T1_2_temp_200|--couple-loss softmax-ce --couple-ranking-temperature 2.0"
-    "T1_3_smooth_005|--couple-loss softmax-ce --couple-label-smoothing 0.05"
-    "T1_3_smooth_010|--couple-loss softmax-ce --couple-label-smoothing 0.10"
-    "T1_4_cos_050|--couple-loss softmax-ce --cosine-power 0.5"
-    "T1_4_cos_150|--couple-loss softmax-ce --cosine-power 1.5"
-    "T1_4_cos_200|--couple-loss softmax-ce --cosine-power 2.0"
-    "T2_1_hardneg_05|--couple-loss softmax-ce --couple-hardneg-fraction 0.5 --couple-hardneg-margin 0.1"
-    "T2_2_pair_v2|--couple-loss softmax-ce --couple-hardneg-fraction 0.5 --couple-hardneg-margin 0.1 --pair-kinematics-v2"
-    "T2_3_ema|--couple-loss softmax-ce --couple-ema-decay 0.999"
-    "T3_1_wider|--couple-loss softmax-ce --couple-hidden-dim 384 --couple-num-residual-blocks 6"
+    "B0_baseline_v2|"
+    "A1_infersent|--couple-embed-mode infersent"
+    "A2_symmetric|--couple-embed-mode symmetric"
+    "A3_bilinear_lrb|--couple-embed-mode bilinear_lrb"
+    "A4_proj_infersent_p16|--couple-embed-mode projected_infersent --couple-projector-dim 16"
+    "A5_proj_infersent_p32|--couple-embed-mode projected_infersent --couple-projector-dim 32"
+    "B1_pair_v2_clean|--pair-kinematics-v2"
+    "C1_hardneg_025_m0|--couple-hardneg-fraction 0.25 --couple-hardneg-margin 0.0"
+    "D1_extended_80ep|--epochs 80"
 )
 
 # Filter via EXPERIMENTS env var (space-separated names). Default = all.
@@ -168,7 +164,7 @@ fi
 NUM_TOTAL=${#ALL_EXPERIMENTS[@]}
 
 echo "================================================================"
-echo "  Couple-reranker improvement sweep"
+echo "  Couple-reranker Batch 2 sweep"
 echo "================================================================"
 echo "Mode:              $([ "${SMOKE_MODE}" = "1" ] && echo "SMOKE" || echo "FULL")"
 echo "Sweep root:        ${SWEEP_ROOT}"
@@ -185,7 +181,6 @@ echo "Seed:              ${SEED}"
 echo "Started:           $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 
-# ---- Run each experiment ----
 NUM_OK=0
 NUM_FAILED=0
 FAILED_NAMES=""
@@ -200,7 +195,7 @@ for entry in "${ALL_EXPERIMENTS[@]}"; do
     echo "----------------------------------------------------------------"
     echo "  [$(($NUM_OK + $NUM_FAILED + 1))/${NUM_TOTAL}]  ${NAME}"
     echo "  Started:  $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "  Flags:    ${EXTRA_FLAGS:-<baseline>}"
+    echo "  Flags:    ${EXTRA_FLAGS:-<baseline v2>}"
     echo "----------------------------------------------------------------"
 
     NO_IN_MEMORY_FLAG=""
@@ -210,7 +205,7 @@ for entry in "${ALL_EXPERIMENTS[@]}"; do
 
     set +e
     # shellcheck disable=SC2086
-    python train_couple_reranker.py \
+    "${PYTHON}" train_couple_reranker.py \
         --data-config "${DATA_CONFIG}" \
         --data-dir "${DATA_DIR}" \
         --val-data-dir "${VAL_DATA_DIR}" \
@@ -247,7 +242,7 @@ for entry in "${ALL_EXPERIMENTS[@]}"; do
 done
 
 echo "================================================================"
-echo "  Sweep complete: ${NUM_OK} OK, ${NUM_FAILED} failed, ${NUM_TOTAL} total"
+echo "  Batch 2 sweep complete: ${NUM_OK} OK, ${NUM_FAILED} failed, ${NUM_TOTAL} total"
 echo "  Finished:       $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  Root:           ${SWEEP_ROOT}"
 echo "================================================================"

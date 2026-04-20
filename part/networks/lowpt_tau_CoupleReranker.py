@@ -137,6 +137,22 @@ def get_model(data_config, **kwargs):
     couple_hardneg_fraction = kwargs.pop('couple_hardneg_fraction', 0.0)
     couple_hardneg_margin = kwargs.pop('couple_hardneg_margin', 0.1)
     pair_kinematics_v2 = kwargs.pop('pair_kinematics_v2', False)
+    pair_physics_v3 = kwargs.pop('pair_physics_v3', False)
+    pair_physics_signif = kwargs.pop('pair_physics_signif', False)
+    couple_embed_mode = kwargs.pop('couple_embed_mode', 'concat')
+    couple_projector_dim = kwargs.pop('couple_projector_dim', 0)
+    tokenize_d = kwargs.pop('tokenize_d', 16)
+    tokenize_blocks = kwargs.pop('tokenize_blocks', 2)
+    tokenize_heads = kwargs.pop('tokenize_heads', 4)
+    ndcg_K = kwargs.pop('ndcg_k', 100)
+    lambda_sigma = kwargs.pop('lambda_sigma', 1.0)
+    couple_multi_positive = kwargs.pop('couple_multi_positive', 'none')
+    couple_use_full_negative_list = kwargs.pop(
+        'couple_use_full_negative_list', False,
+    )
+    aux_vertex_weight = kwargs.pop('aux_vertex_weight', 0.0)
+    event_context = kwargs.pop('event_context', 'none')
+    context_dim = kwargs.pop('context_dim', 32)
 
     # Pop unused args from other heads
     for unused_arg in [
@@ -171,13 +187,25 @@ def get_model(data_config, **kwargs):
     _logger.info(f'Frozen cascade: {cascade_params:,} params')
 
     # ---- Stage 3: CoupleReranker (trainable) ----
-    # input_dim is 51 by default, 55 with `pair_kinematics_v2` (T2.2).
-    from utils.couple_features import COUPLE_FEATURE_DIM, COUPLE_FEATURE_DIM_V2
-    couple_input_dim = (
-        COUPLE_FEATURE_DIM_V2 if pair_kinematics_v2 else COUPLE_FEATURE_DIM
+    # CoupleReranker derives input_dim internally from couple_embed_mode,
+    # couple_projector_dim, and rest_dim. rest_dim = 19 by default
+    # (blocks 2+3+4) or 23 with pair_kinematics_v2 (4 extra physics dims).
+    from utils.couple_features import (
+        COUPLE_FEATURE_DIM,
+        COUPLE_FEATURE_DIM_V2,
+        COUPLE_FEATURE_DIM_V3,
+        PAIR_PHYSICS_V3_EXTRA_DIM,
     )
+    from utils.couple_features import PAIR_PHYSICS_SIGNIF_EXTRA_DIM
+    feature_dim = COUPLE_FEATURE_DIM
+    if pair_kinematics_v2:
+        feature_dim = COUPLE_FEATURE_DIM_V2
+    if pair_physics_v3:
+        feature_dim += PAIR_PHYSICS_V3_EXTRA_DIM
+    if pair_physics_signif:
+        feature_dim += PAIR_PHYSICS_SIGNIF_EXTRA_DIM
+    rest_dim = feature_dim - 32
     couple_reranker = CoupleReranker(
-        input_dim=couple_input_dim,
         hidden_dim=couple_hidden_dim,
         num_residual_blocks=couple_num_residual_blocks,
         dropout=couple_dropout,
@@ -187,18 +215,36 @@ def get_model(data_config, **kwargs):
         label_smoothing=couple_label_smoothing,
         hardneg_fraction=couple_hardneg_fraction,
         hardneg_margin=couple_hardneg_margin,
+        ndcg_K=ndcg_K,
+        lambda_sigma=lambda_sigma,
+        multi_positive=couple_multi_positive,
+        use_full_negative_list=couple_use_full_negative_list,
+        aux_vertex_weight=aux_vertex_weight,
+        event_context=event_context,
+        context_dim=context_dim,
+        couple_embed_mode=couple_embed_mode,
+        couple_projector_dim=couple_projector_dim,
+        rest_dim=rest_dim,
+        tokenize_d=tokenize_d,
+        tokenize_blocks=tokenize_blocks,
+        tokenize_heads=tokenize_heads,
     )
     couple_params = sum(p.numel() for p in couple_reranker.parameters())
     _logger.info(
         f'CoupleReranker: {couple_params:,} params (trainable, '
         f'hidden_dim={couple_hidden_dim}, '
-        f'num_residual_blocks={couple_num_residual_blocks})'
+        f'num_residual_blocks={couple_num_residual_blocks}, '
+        f'embed_mode={couple_embed_mode}, '
+        f'projector_dim={couple_projector_dim}, '
+        f'input_dim={couple_reranker.input_dim})'
     )
 
     # ---- CoupleCascadeModel: glue ----
     model = CoupleCascadeModel(
         cascade=cascade,
         couple_reranker=couple_reranker,
+        pair_physics_v3=pair_physics_v3,
+        pair_physics_signif=pair_physics_signif,
         top_k2=top_k2,
         k_values_tracks=k_values_tracks,
         pair_kinematics_v2=pair_kinematics_v2,

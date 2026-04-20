@@ -38,6 +38,8 @@ class CoupleCascadeModel(nn.Module):
         top_k2: int = 50,
         k_values_tracks: tuple[int, ...] = (30, 50, 75, 100, 200),
         pair_kinematics_v2: bool = False,
+        pair_physics_v3: bool = False,
+        pair_physics_signif: bool = False,
     ):
         super().__init__()
         self.cascade = cascade
@@ -52,6 +54,12 @@ class CoupleCascadeModel(nn.Module):
         # (51 + 4 extra pair-kinematic features). The reranker's
         # `input_dim` must match.
         self.pair_kinematics_v2 = pair_kinematics_v2
+        # B3.H8: when True, adds 5 extra pair-physics v3 features
+        # (Kalman-χ² proxy, DCA-sig sum, lab helicity, log BW ρ/a1).
+        self.pair_physics_v3 = pair_physics_v3
+        # B4.H9: when True, adds 3 significance-normalised pair features
+        # (mass pull, Δφ significance, pT-balance significance).
+        self.pair_physics_signif = pair_physics_signif
 
         # Freeze the entire cascade (Stage 1 + Stage 2). The optimizer
         # will pick up only `couple_reranker.parameters()` because we
@@ -192,9 +200,14 @@ class CoupleCascadeModel(nn.Module):
             top_k2_track_labels=top_k2_data['track_labels'],
             track_valid_mask=top_k2_data['track_valid_mask'],
             pair_kinematics_v2=self.pair_kinematics_v2,
+            pair_physics_v3=self.pair_physics_v3,
+            pair_physics_signif=self.pair_physics_signif,
         )
         couple_inputs['n_gt_in_top_k1'] = top_k2_data['n_gt_in_top_k1']
         couple_inputs['n_gt_in_top_k_tracks'] = top_k2_data['n_gt_in_top_k_tracks']
+        # H6 event-context path: expose the K2 per-track feature tensor
+        # so the reranker can pool it into a per-event summary.
+        couple_inputs['k2_features'] = top_k2_data['features']
         return couple_inputs
 
     def forward(
@@ -218,7 +231,10 @@ class CoupleCascadeModel(nn.Module):
         couple_inputs = self._build_couple_inputs(
             points, features, lorentz_vectors, mask, dummy_track_labels,
         )
-        scores = self.couple_reranker(couple_inputs['couple_features'])
+        scores = self.couple_reranker(
+            couple_inputs['couple_features'],
+            k2_features=couple_inputs.get('k2_features'),
+        )
         return scores, couple_inputs['filter_a_mask']
 
     def compute_loss(
@@ -249,11 +265,14 @@ class CoupleCascadeModel(nn.Module):
         filter_a_mask = couple_inputs['filter_a_mask']
         n_gt_in_top_k1 = couple_inputs['n_gt_in_top_k1']
         n_gt_in_top_k_tracks = couple_inputs['n_gt_in_top_k_tracks']
+        # H6 event-context path needs access to the K2 track features.
+        k2_features = couple_inputs.get('k2_features')
 
         loss_dict = self.couple_reranker.compute_loss(
             couple_features=couple_features,
             couple_labels=couple_labels.to(couple_features.dtype),
             couple_mask=filter_a_mask.to(couple_features.dtype),
+            k2_features=k2_features,
         )
         loss_dict['_couple_labels'] = couple_labels
         loss_dict['_couple_mask'] = filter_a_mask

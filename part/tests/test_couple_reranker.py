@@ -457,3 +457,652 @@ class TestOverfitsTinyTask:
             f'Loss did not decrease enough: initial={initial_loss:.4f}, '
             f'final={final_loss:.4f}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Couple-embedding modes (Batch 2): pluggable Block-1 aggregation
+# ---------------------------------------------------------------------------
+
+class TestCoupleEmbedMode:
+    """Pluggable couple-embedding block: concat / infersent / symmetric /
+    bilinear_lrb / projected_infersent. The model always consumes the raw
+    51-dim couple feature tensor emitted by the feature builder; mode-specific
+    Block-1 reconstruction happens inside the model's forward (so projector
+    params can receive gradients).
+
+    Formulas (d = 16 per-track raw dim, rest = 19 for physics + geom +
+    cascade-score blocks, r = 8 bilinear rank):
+
+        concat              : [t_i, t_j]                           → 32 + 19 = 51
+        infersent           : [t_i, t_j, |t_i-t_j|, t_i ⊙ t_j]     → 64 + 19 = 83
+        symmetric           : [max(t_i,t_j), mean, |t_i-t_j|]      → 48 + 19 = 67
+        bilinear_lrb (r=8)  : [t_i, t_j, (Ut_i) ⊙ (Vt_j)]          → 40 + 19 = 59
+        projected_infersent : [φ(t_i), φ(t_j), |Δφ|, φ(t_i)⊙φ(t_j)] → 4p + 19
+          where φ(t) = LayerNorm(ReLU(Linear(d, p)(t))).
+    """
+
+    def test_default_mode_is_concat(self):
+        model = CoupleReranker()
+        assert model.couple_embed_mode == 'concat'
+
+    @pytest.mark.parametrize(
+        'mode,projector_dim,expected_input_dim',
+        [
+            ('concat', 0, 51),
+            ('infersent', 0, 83),
+            ('symmetric', 0, 67),
+            ('bilinear_lrb', 0, 59),
+            ('projected_infersent', 16, 83),
+            ('projected_infersent', 32, 147),
+        ],
+    )
+    def test_input_dim_computed_from_mode(
+        self, mode, projector_dim, expected_input_dim,
+    ):
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            couple_projector_dim=projector_dim,
+        )
+        assert model.input_dim == expected_input_dim
+
+    @pytest.mark.parametrize(
+        'mode,projector_dim',
+        [
+            ('concat', 0),
+            ('infersent', 0),
+            ('symmetric', 0),
+            ('bilinear_lrb', 0),
+            ('projected_infersent', 16),
+            ('projected_infersent', 32),
+        ],
+    )
+    def test_forward_shape_per_mode(self, mode, projector_dim):
+        """All modes consume the raw 51-dim couple tensor and emit (B, C)."""
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            couple_projector_dim=projector_dim,
+        )
+        model.eval()
+        x = torch.randn(2, 51, 5)
+        scores = model(x)
+        assert scores.shape == (2, 5)
+
+    def test_symmetric_mode_is_permutation_invariant(self):
+        """Swap the two track blocks — scores must match exactly."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_embed_mode='symmetric')
+        model.eval()
+        x = torch.randn(2, 51, 4)
+        x_swapped = x.clone()
+        x_swapped[:, :16, :] = x[:, 16:32, :]
+        x_swapped[:, 16:32, :] = x[:, :16, :]
+        s1 = model(x)
+        s2 = model(x_swapped)
+        assert torch.allclose(s1, s2, atol=1e-5)
+
+    def test_concat_mode_is_not_permutation_invariant(self):
+        """Regression guard: concat asymmetry must survive the refactor."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_embed_mode='concat')
+        model.eval()
+        x = torch.randn(2, 51, 4)
+        x_swapped = x.clone()
+        x_swapped[:, :16, :] = x[:, 16:32, :]
+        x_swapped[:, 16:32, :] = x[:, :16, :]
+        s1 = model(x)
+        s2 = model(x_swapped)
+        assert not torch.allclose(s1, s2, atol=1e-3)
+
+    def test_projected_infersent_has_trainable_projector(self):
+        model = CoupleReranker(
+            couple_embed_mode='projected_infersent',
+            couple_projector_dim=16,
+        )
+        assert hasattr(model, 'couple_projector')
+        proj_params = list(model.couple_projector.parameters())
+        assert len(proj_params) > 0
+        assert all(p.requires_grad for p in proj_params)
+
+    def test_projected_infersent_gradient_flows_through_projector(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            couple_embed_mode='projected_infersent',
+            couple_projector_dim=16,
+        )
+        x = torch.randn(2, 51, 4)
+        loss = model(x).sum()
+        loss.backward()
+        grads = [
+            p.grad for p in model.couple_projector.parameters()
+            if p.grad is not None
+        ]
+        assert len(grads) > 0
+        assert any(g.abs().sum().item() > 0 for g in grads)
+
+    def test_bilinear_lrb_has_trainable_interaction(self):
+        model = CoupleReranker(couple_embed_mode='bilinear_lrb')
+        assert hasattr(model, 'bilinear_u')
+        assert hasattr(model, 'bilinear_v')
+        params = (
+            list(model.bilinear_u.parameters())
+            + list(model.bilinear_v.parameters())
+        )
+        assert all(p.requires_grad for p in params)
+
+    def test_bilinear_lrb_gradient_flows_through_interaction(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_embed_mode='bilinear_lrb')
+        x = torch.randn(2, 51, 4)
+        loss = model(x).sum()
+        loss.backward()
+        u_grad = model.bilinear_u.weight.grad
+        v_grad = model.bilinear_v.weight.grad
+        assert u_grad is not None and u_grad.abs().sum().item() > 0
+        assert v_grad is not None and v_grad.abs().sum().item() > 0
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match='couple_embed_mode'):
+            CoupleReranker(couple_embed_mode='gibberish')
+
+    def test_projector_dim_required_for_projected_infersent(self):
+        with pytest.raises(ValueError, match='couple_projector_dim'):
+            CoupleReranker(couple_embed_mode='projected_infersent',
+                           couple_projector_dim=0)
+
+    def test_param_count_grows_with_projector_width(self):
+        narrow = sum(
+            p.numel() for p in CoupleReranker(
+                couple_embed_mode='projected_infersent',
+                couple_projector_dim=16,
+            ).parameters()
+        )
+        wide = sum(
+            p.numel() for p in CoupleReranker(
+                couple_embed_mode='projected_infersent',
+                couple_projector_dim=32,
+            ).parameters()
+        )
+        assert wide > narrow
+
+    def test_loss_works_across_modes(self):
+        """Every mode must run compute_loss end-to-end without error."""
+        for mode, pdim in [
+            ('concat', 0),
+            ('infersent', 0),
+            ('symmetric', 0),
+            ('bilinear_lrb', 0),
+            ('projected_infersent', 16),
+        ]:
+            model = CoupleReranker(
+                couple_embed_mode=mode,
+                couple_projector_dim=pdim,
+                couple_loss='softmax-ce',
+                label_smoothing=0.10,
+            )
+            couple_features = torch.randn(2, 51, 20)
+            couple_labels = torch.zeros(2, 20)
+            couple_labels[:, 0] = 1.0
+            couple_mask = torch.ones(2, 20)
+            out = model.compute_loss(
+                couple_features, couple_labels, couple_mask,
+            )
+            assert torch.isfinite(out['total_loss'])
+
+
+# ---------------------------------------------------------------------------
+# Tokenization modes (Batch 3 — H15): feature-as-token self-attention
+# within each couple. No cross-couple attention.
+# ---------------------------------------------------------------------------
+
+class TestTokenizationModes:
+    """FT-Transformer and per-track token modes.
+
+    Both modes consume the raw 51-dim couple feature tensor and tokenize
+    each scalar into a token of width ``d_token``. A ``[CLS]`` token is
+    prepended, the sequence runs through an internal Transformer stack,
+    and the ``[CLS]`` output is linearly projected to ``hidden_dim`` for
+    the downstream residual stack. This replaces the Block-1 rebuild;
+    ``input_dim`` in these modes equals ``hidden_dim``.
+    """
+
+    @pytest.mark.parametrize(
+        'mode', ['ft_transformer', 'per_track_tokens'],
+    )
+    def test_forward_shape(self, mode):
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            tokenize_d=16,
+            tokenize_blocks=2,
+            tokenize_heads=4,
+        )
+        model.eval()
+        x = torch.randn(2, 51, 5)
+        out = model(x)
+        assert out.shape == (2, 5)
+
+    def test_ft_transformer_has_feature_embedding(self):
+        model = CoupleReranker(
+            couple_embed_mode='ft_transformer',
+            tokenize_d=16,
+        )
+        assert hasattr(model, 'token_encoder')
+        feature_embed = model.token_encoder.feature_embed
+        assert feature_embed.shape == (51, 16)
+
+    def test_per_track_tokens_has_track_embedding(self):
+        model = CoupleReranker(
+            couple_embed_mode='per_track_tokens',
+            tokenize_d=16,
+        )
+        assert hasattr(model.token_encoder, 'track_embed')
+        track_embed = model.token_encoder.track_embed
+        assert track_embed.shape == (3, 16)
+
+    def test_ft_transformer_no_track_embedding(self):
+        model = CoupleReranker(
+            couple_embed_mode='ft_transformer',
+            tokenize_d=16,
+        )
+        assert not hasattr(model.token_encoder, 'track_embed')
+
+    @pytest.mark.parametrize(
+        'mode', ['ft_transformer', 'per_track_tokens'],
+    )
+    def test_gradient_flows_through_feature_embed(self, mode):
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            tokenize_d=16,
+            tokenize_blocks=2,
+            tokenize_heads=4,
+        )
+        x = torch.randn(2, 51, 4)
+        loss = model(x).sum()
+        loss.backward()
+        grad = model.token_encoder.feature_embed.grad
+        assert grad is not None
+        assert grad.abs().sum().item() > 0
+
+    def test_per_track_tokens_preserves_ij_asymmetry(self):
+        """Swapping the per-track halves must change the score (the
+        track_embed distinguishes i from j)."""
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            couple_embed_mode='per_track_tokens',
+            tokenize_d=16,
+            tokenize_blocks=2,
+            tokenize_heads=4,
+        )
+        model.eval()
+        x = torch.randn(2, 51, 4)
+        x_swapped = x.clone()
+        x_swapped[:, :16, :] = x[:, 16:32, :]
+        x_swapped[:, 16:32, :] = x[:, :16, :]
+        s1 = model(x)
+        s2 = model(x_swapped)
+        assert not torch.allclose(s1, s2, atol=1e-3)
+
+    def test_invalid_tokenize_heads_raises(self):
+        """``tokenize_heads`` must divide ``tokenize_d``."""
+        with pytest.raises(
+            (ValueError, AssertionError), match='divisible|heads',
+        ):
+            CoupleReranker(
+                couple_embed_mode='ft_transformer',
+                tokenize_d=17,  # 17 is prime, not divisible by 4 heads
+                tokenize_heads=4,
+            )
+
+    @pytest.mark.parametrize(
+        'mode', ['ft_transformer', 'per_track_tokens'],
+    )
+    def test_loss_runs_end_to_end(self, mode):
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            tokenize_d=16,
+            tokenize_blocks=2,
+            tokenize_heads=4,
+            couple_loss='softmax-ce',
+            label_smoothing=0.10,
+        )
+        features = torch.randn(2, 51, 20)
+        labels = torch.zeros(2, 20)
+        labels[:, 0] = 1.0
+        mask = torch.ones(2, 20)
+        out = model.compute_loss(features, labels, mask)
+        assert torch.isfinite(out['total_loss'])
+
+    def test_tokenization_replaces_block1_rebuild(self):
+        """In token modes, the main ``input_projection`` first-layer
+        Conv1d has input_channels = hidden_dim (CLS readout), not the
+        raw 51."""
+        model = CoupleReranker(
+            couple_embed_mode='ft_transformer',
+            tokenize_d=16,
+            hidden_dim=256,
+        )
+        first_conv = model.input_projection[0]
+        assert first_conv.in_channels == 256
+
+    def test_concat_baseline_unchanged(self):
+        """Concat mode must keep the legacy 51-in-channel first-conv so
+        v3 and earlier checkpoints still load."""
+        model = CoupleReranker(couple_embed_mode='concat')
+        assert model.input_projection[0].in_channels == 51
+
+    @pytest.mark.parametrize(
+        'mode', ['ft_transformer', 'per_track_tokens'],
+    )
+    def test_tokenizer_handles_large_batch_times_c(self, mode):
+        """Regression: B*C > 65 535 must not hit PyTorch's flash-SDP cap.
+
+        B=16, C=4200 → 67 200 > 65 000 chunk boundary. Verify output
+        shape and no RuntimeError.
+        """
+        model = CoupleReranker(
+            couple_embed_mode=mode,
+            tokenize_d=16,
+            tokenize_blocks=1,
+            tokenize_heads=4,
+        )
+        model.eval()
+        # B*C > SDPA cap forces the chunked path.
+        x = torch.randn(16, 51, 4200)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (16, 4200)
+        assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# BN-calibration safety for event-context mode (Batch-3 F1 regression)
+# ---------------------------------------------------------------------------
+
+class TestBNCalibrationSafety:
+    """F1 regression: `event_context='deepset_film'` adds a required
+    `k2_features` forward argument. Any helper that calls the reranker
+    directly (e.g. BN calibration) must thread k2_features through."""
+
+    def test_event_context_forward_requires_k2_features(self):
+        """Sanity: without k2_features, event-context mode must raise."""
+        model = CoupleReranker(
+            event_context='deepset_film', context_dim=32,
+        )
+        model.eval()
+        x = torch.randn(2, 51, 5)
+        with pytest.raises(RuntimeError, match='k2_features'):
+            model(x)
+
+    def test_event_context_forward_with_k2_features(self):
+        """With k2_features supplied, forward must produce finite output."""
+        model = CoupleReranker(
+            event_context='deepset_film', context_dim=32,
+        )
+        model.eval()
+        x = torch.randn(2, 51, 5)
+        k2 = torch.randn(2, 16, 60)
+        with torch.no_grad():
+            out = model(x, k2_features=k2)
+        assert out.shape == (2, 5)
+        assert torch.isfinite(out).all()
+
+    def test_event_context_compute_loss_threads_k2_features(self):
+        """compute_loss must forward k2_features through to _encode."""
+        model = CoupleReranker(
+            event_context='deepset_film', context_dim=32,
+            couple_loss='softmax-ce', label_smoothing=0.10,
+        )
+        features = torch.randn(2, 51, 20)
+        labels = torch.zeros(2, 20)
+        labels[:, 0] = 1.0
+        mask = torch.ones(2, 20)
+        k2 = torch.randn(2, 16, 60)
+        out = model.compute_loss(
+            features, labels, mask, k2_features=k2,
+        )
+        assert torch.isfinite(out['total_loss'])
+
+    def test_non_event_context_ignores_k2_features(self):
+        """Back-compat: concat / projector modes must ignore k2_features
+        (passing None or a tensor — both must work)."""
+        model = CoupleReranker(
+            couple_embed_mode='projected_infersent',
+            couple_projector_dim=32,
+            event_context='none',
+        )
+        model.eval()
+        x = torch.randn(2, 51, 5)
+        # None case
+        with torch.no_grad():
+            out_none = model(x)
+        assert out_none.shape == (2, 5)
+        # With a tensor — still fine (ignored).
+        k2 = torch.randn(2, 16, 60)
+        with torch.no_grad():
+            out_tensor = model(x, k2_features=k2)
+        assert out_tensor.shape == (2, 5)
+        # Results should be identical since k2_features is ignored here.
+        assert torch.allclose(out_none, out_tensor, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# LambdaLoss@K=100 NDCG-Loss2++ (Batch 3 — H1)
+#
+#   δ_ij = |G_i − G_j| · |1/D_i − 1/D_j|
+#     G = 1 for positives, 0 for negatives
+#     D = log₂(rank + 1)    (rank is 1-indexed)
+#   Loss = Σ_{i,j: G_i ≠ G_j, rank_i ≤ K or rank_j ≤ K}
+#            δ_ij · log(1 + exp(−σ (s_i − s_j)))
+# ---------------------------------------------------------------------------
+
+class TestLambdaNDCGLoss:
+    def test_constructor_accepts_loss_name(self):
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        assert model.couple_loss == 'lambda_ndcg2pp'
+
+    def test_invalid_loss_still_rejected(self):
+        with pytest.raises(ValueError, match='couple_loss'):
+            CoupleReranker(couple_loss='pairwise_nonsense')
+
+    def test_loss_dict_shape(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        features = torch.randn(2, 51, 30)
+        labels = torch.zeros(2, 30)
+        labels[:, 0] = 1.0
+        labels[:, 5] = 1.0
+        mask = torch.ones(2, 30)
+        out = model.compute_loss(features, labels, mask)
+        assert 'total_loss' in out
+        assert 'ranking_loss' in out
+        assert out['total_loss'].dim() == 0
+        assert torch.isfinite(out['total_loss'])
+
+    def test_gradient_flow(self):
+        """Gradient must flow from the lambda loss back to model weights."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        features = torch.randn(2, 51, 30)
+        labels = torch.zeros(2, 30)
+        labels[:, 0] = 1.0
+        mask = torch.ones(2, 30)
+        out = model.compute_loss(features, labels, mask)
+        out['total_loss'].backward()
+        grad_norms = [
+            p.grad.abs().sum().item()
+            for p in model.parameters()
+            if p.grad is not None
+        ]
+        assert any(g > 0 for g in grad_norms)
+
+    def test_zero_when_all_positives_rank_above_negatives(self):
+        """If every positive score dominates every negative by a large
+        margin, the loss should be negligibly small."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        model.eval()  # turn off BN training
+        # fabricate scores directly via mocking forward
+        scores = torch.zeros(1, 10)
+        scores[0, :3] = 10.0  # 3 positives have very high score
+        scores[0, 3:] = -10.0  # 7 negatives have very low score
+        labels = torch.zeros(1, 10)
+        labels[:, :3] = 1.0
+        mask = torch.ones(1, 10)
+        loss = model._lambda_ndcg_loss(scores, labels, mask)
+        assert loss.item() < 1e-3
+
+    def test_nonzero_when_positives_below_negatives(self):
+        """If positives are below negatives, the loss must be strictly
+        positive (there is at least one swap to punish)."""
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        scores = torch.zeros(1, 10)
+        scores[0, :3] = -5.0  # positives low
+        scores[0, 3:] = 5.0   # negatives high
+        labels = torch.zeros(1, 10)
+        labels[:, :3] = 1.0
+        mask = torch.ones(1, 10)
+        loss = model._lambda_ndcg_loss(scores, labels, mask)
+        assert loss.item() > 0.1
+
+    def test_K_truncation_drops_faraway_swaps(self):
+        """Setting ndcg_K = 3 should make swaps involving rank > 3 pairs
+        contribute zero weight — total loss is ≤ untruncated version."""
+        torch.manual_seed(0)
+        scores = torch.randn(1, 50)
+        labels = torch.zeros(1, 50)
+        labels[:, 0] = 1.0
+        labels[:, 45] = 1.0  # positive way out at rank 45
+        mask = torch.ones(1, 50)
+
+        m_full = CoupleReranker(
+            couple_loss='lambda_ndcg2pp', ndcg_K=50,
+        )
+        m_trunc = CoupleReranker(
+            couple_loss='lambda_ndcg2pp', ndcg_K=3,
+        )
+        loss_full = m_full._lambda_ndcg_loss(scores, labels, mask).item()
+        loss_trunc = m_trunc._lambda_ndcg_loss(scores, labels, mask).item()
+        # Truncation CAN drop pairs from the sum; ratio should be <= 1.
+        # Use non-strict inequality because pairs involving the rank-0
+        # positive may still dominate.
+        assert loss_trunc <= loss_full + 1e-6
+
+    def test_ignores_padded_positions(self):
+        """Masked-out positions contribute zero to the loss."""
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp')
+        scores = torch.randn(1, 20)
+        labels = torch.zeros(1, 20)
+        labels[:, 0] = 1.0
+        labels[:, 15] = 1.0  # this is masked out, should not contribute
+        mask = torch.ones(1, 20)
+        mask[:, 10:] = 0.0
+
+        scores_masked_changed = scores.clone()
+        scores_masked_changed[:, 10:] = scores[:, 10:] + 100.0
+
+        loss_a = model._lambda_ndcg_loss(scores, labels, mask).item()
+        loss_b = model._lambda_ndcg_loss(
+            scores_masked_changed, labels, mask,
+        ).item()
+        assert abs(loss_a - loss_b) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Multi-positive soft target for softmax-CE (Batch 3 — H2)
+#
+#   uniform target: 1/k on each GT couple, 0 elsewhere (k = # GT per event)
+#   loss: cross-entropy between this target and the softmax over all valid
+#         couples.
+# ---------------------------------------------------------------------------
+
+class TestMultiPositive:
+    def test_default_multi_positive_is_none(self):
+        model = CoupleReranker(couple_loss='softmax-ce')
+        assert model.multi_positive == 'none'
+
+    def test_invalid_multi_positive_rejected(self):
+        with pytest.raises(ValueError, match='multi_positive'):
+            CoupleReranker(
+                couple_loss='softmax-ce', multi_positive='nonsense',
+            )
+
+    def test_multi_positive_loss_finite(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(
+            couple_loss='softmax-ce', multi_positive='uniform',
+        )
+        features = torch.randn(2, 51, 20)
+        labels = torch.zeros(2, 20)
+        labels[:, 0] = 1.0
+        labels[:, 3] = 1.0  # 2 GT per event
+        mask = torch.ones(2, 20)
+        out = model.compute_loss(features, labels, mask)
+        assert torch.isfinite(out['total_loss'])
+
+    def test_multi_positive_reduces_to_single_when_k_eq_1(self):
+        """One GT per event: multi_positive='uniform' must produce the
+        same loss as the default single-positive softmax-CE (ε=0).
+
+        Weight init and negative sampling both draw from the global RNG,
+        so re-seed before every forward + loss call for a fair test.
+        """
+        def make_model(multi_positive):
+            torch.manual_seed(0)
+            return CoupleReranker(
+                couple_loss='softmax-ce',
+                multi_positive=multi_positive,
+                label_smoothing=0.0,
+            )
+
+        features = torch.randn(2, 51, 20)
+        labels = torch.zeros(2, 20)
+        labels[:, 0] = 1.0  # exactly 1 GT per event
+        mask = torch.ones(2, 20)
+
+        model_single = make_model('none')
+        model_multi = make_model('uniform')
+        model_single.eval()
+        model_multi.eval()
+
+        torch.manual_seed(99)
+        scores_single = model_single.forward(features)
+        torch.manual_seed(99)
+        scores_multi = model_multi.forward(features)
+        # Ensure forward paths produced identical scores under the same
+        # seed (sanity check; multi_positive does not affect forward).
+        assert torch.allclose(scores_single, scores_multi, atol=1e-6)
+
+        torch.manual_seed(123)
+        loss_single = model_single._softmax_ce_loss(
+            scores_single, labels, mask,
+        )
+        torch.manual_seed(123)
+        loss_multi = model_multi._softmax_ce_loss(
+            scores_multi, labels, mask,
+        )
+        assert torch.allclose(loss_single, loss_multi, atol=1e-5)
+
+    def test_multi_positive_differs_from_single_when_k_gt_1(self):
+        torch.manual_seed(0)
+        model_single = CoupleReranker(
+            couple_loss='softmax-ce', multi_positive='none',
+            label_smoothing=0.0,
+        )
+        torch.manual_seed(0)
+        model_multi = CoupleReranker(
+            couple_loss='softmax-ce', multi_positive='uniform',
+            label_smoothing=0.0,
+        )
+        features = torch.randn(2, 51, 20)
+        labels = torch.zeros(2, 20)
+        labels[:, 0] = 1.0
+        labels[:, 5] = 1.0
+        labels[:, 10] = 1.0  # 3 GT per event
+        mask = torch.ones(2, 20)
+        loss_single = model_single._softmax_ce_loss(
+            model_single.forward(features), labels, mask,
+        )
+        loss_multi = model_multi._softmax_ce_loss(
+            model_multi.forward(features), labels, mask,
+        )
+        assert not torch.allclose(loss_single, loss_multi, atol=1e-3)
