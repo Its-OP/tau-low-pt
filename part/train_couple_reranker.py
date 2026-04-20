@@ -148,6 +148,10 @@ def train_one_epoch(
     mask_input_index: int,
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
+    ema_model: torch.nn.Module | None = None,
+    train_aug: str = 'none',
+    smear_scale: float = 1.0,
+    drop_cov_features: bool = False,
 ) -> tuple[dict[str, float], int]:
     """Train the CoupleReranker for one epoch (frozen cascade inside)."""
     model.train()
@@ -177,6 +181,17 @@ def train_one_epoch(
         )
         points, features, lorentz_vectors, mask = model_inputs
 
+        if train_aug == 'cov_smear':
+            from utils.train_augmentation import (
+                apply_cov_smear,
+                drop_cov_features as _drop_cov_features,
+            )
+            features = apply_cov_smear(
+                features, smear_scale=smear_scale,
+            )
+            if drop_cov_features:
+                features = _drop_cov_features(features)
+
         optimizer.zero_grad(set_to_none=True)
         loss_dict = model.compute_loss(
             points, features, lorentz_vectors, mask, track_labels,
@@ -202,13 +217,46 @@ def train_one_epoch(
             continue
 
         loss.backward()
-        if grad_clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                grad_clip_max_norm,
+
+        # SAM / ASAM: do a second forward-backward pass at the
+        # gradient-ascent-perturbed weights, then step with the second
+        # gradient. Guarded by isinstance to keep the fast path for the
+        # plain-optimizer case unchanged.
+        from utils.sam_optimizer import SAM as _SAM
+        if isinstance(optimizer, _SAM):
+            optimizer.first_step(zero_grad=True)
+            loss_dict_2 = model.compute_loss(
+                points, features, lorentz_vectors, mask, track_labels,
             )
-        optimizer.step()
+            loss_dict_2.pop('_scores', None)
+            loss_dict_2.pop('_couple_labels', None)
+            loss_dict_2.pop('_couple_mask', None)
+            loss_dict_2.pop('_n_gt_in_top_k1', None)
+            loss_dict_2.pop('_n_gt_in_top_k_tracks', None)
+            loss_2 = loss_dict_2['total_loss']
+            if not torch.isfinite(loss_2).item():
+                # Undo the perturbation and skip the update for this batch.
+                non_finite_batches += 1
+                optimizer.second_step(zero_grad=True)
+                global_batch_count += 1
+                continue
+            loss_2.backward()
+            if grad_clip_max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()),
+                    grad_clip_max_norm,
+                )
+            optimizer.second_step(zero_grad=True)
+        else:
+            if grad_clip_max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()),
+                    grad_clip_max_norm,
+                )
+            optimizer.step()
         scheduler.step_batch()
+        if ema_model is not None:
+            ema_model.update_parameters(model.couple_reranker)
 
         if loss_accumulators is None:
             loss_accumulators = {
@@ -296,19 +344,20 @@ def calibrate_reranker_batchnorm(
             )
             points, features, lorentz_vectors, mask = model_inputs
 
-            # Forward through the full pipeline to update BN stats
+            # Forward through the full pipeline to update BN stats.
+            # Only the reranker has trainable BN; Stage 1 and Stage 2 are
+            # frozen (their BN stats are untouched here).
             dummy_labels = torch.zeros_like(mask)
-            model._build_couple_inputs(
-                points, features, lorentz_vectors, mask, dummy_labels,
-            )
-            # The couple reranker forward is called inside compute_loss,
-            # but we just need the couple features to flow through BN.
-            # _build_couple_inputs builds features; we also need them to
-            # pass through the reranker's BN layers.
             couple_inputs = model._build_couple_inputs(
                 points, features, lorentz_vectors, mask, dummy_labels,
             )
-            model.couple_reranker(couple_inputs['couple_features'])
+            # Thread k2_features through to support the H6 event-context
+            # path; .get() keeps backward compatibility with CoupleCascadeModel
+            # versions that don't populate k2_features.
+            model.couple_reranker(
+                couple_inputs['couple_features'],
+                k2_features=couple_inputs.get('k2_features'),
+            )
 
             if (batch_index + 1) % 50 == 0:
                 logger.info(
@@ -442,9 +491,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--plateau-patience', type=int, default=5)
     parser.add_argument('--min-lr', type=float, default=1e-6)
     parser.add_argument(
-        '--cosine-power', type=float, default=1.0,
+        '--cosine-power', type=float, default=2.0,
         help='Exponent for cosine LR decay. <1 = steeper (faster drop), '
-             '>1 = delayed (stays high then drops steeply). Default 1.0.',
+             '>1 = delayed (stays high then drops steeply). Default 2.0 '
+             '(baseline v2, 2026-04-17 sweep result).',
     )
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--train-fraction', type=float, default=0.8)
@@ -456,12 +506,271 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--save-every', type=int, default=5)
     parser.add_argument('--keep-best-k', type=int, default=5)
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Global seed for Python, NumPy, PyTorch (CPU + CUDA). '
+             'If unset, RNG stays non-deterministic (legacy behavior).',
+    )
     # CoupleReranker architecture knobs
     parser.add_argument('--couple-hidden-dim', type=int, default=256)
     parser.add_argument('--couple-num-residual-blocks', type=int, default=4)
     parser.add_argument('--couple-dropout', type=float, default=0.1)
     parser.add_argument('--couple-ranking-num-samples', type=int, default=50)
     parser.add_argument('--couple-ranking-temperature', type=float, default=1.0)
+    parser.add_argument(
+        '--couple-loss',
+        type=str,
+        default='softmax-ce',
+        choices=['pairwise', 'softmax-ce', 'lambda_ndcg2pp'],
+        help=(
+            "Couple-reranker loss branch. 'pairwise' = softplus pairwise "
+            "ranking (legacy). 'softmax-ce' = listwise softmax "
+            "cross-entropy (ListMLE top-1), default baseline v2. "
+            "'lambda_ndcg2pp' = LambdaLoss NDCG-Loss2++ pair-weighting "
+            "with K-truncation (Wang 2018, arXiv:1811.04768); "
+            "directly optimises NDCG@K ranking metric."
+        ),
+    )
+    parser.add_argument(
+        '--ndcg-k', type=int, default=100,
+        help=(
+            "Top-K truncation for --couple-loss lambda_ndcg2pp. "
+            "Pairs whose BOTH ranks exceed K are dropped from the sum. "
+            "Default 100 (matches the C@100 operating metric)."
+        ),
+    )
+    parser.add_argument(
+        '--lambda-sigma', type=float, default=1.0,
+        help=(
+            "RankNet sigmoid scale for the lambda_ndcg2pp loss. "
+            "Higher = sharper swap penalty. Default 1.0."
+        ),
+    )
+    parser.add_argument(
+        '--couple-use-full-negative-list',
+        action='store_true',
+        help=(
+            'H4: disable 50-sample negative cap in the couple loss and '
+            'use every valid non-GT couple in each event. Slower per '
+            'step but removes sampling noise at the rank-100 boundary.'
+        ),
+    )
+    parser.add_argument(
+        '--couple-multi-positive',
+        type=str,
+        default='none',
+        choices=['none', 'uniform', 'soft_or'],
+        help=(
+            "Target distribution for softmax-CE when an event has >1 GT "
+            "couple. 'none' (default) = single-positive legacy; treats "
+            "each GT independently in its own pool. 'uniform' (H2) = "
+            "shared pool with target mass 1/k on each positive. "
+            "'soft_or' (H3) = MIL-aligned numerator: logsumexp over "
+            "positive logits instead of mean. "
+            "See Batch-3 plan."
+        ),
+    )
+    parser.add_argument(
+        '--couple-label-smoothing',
+        type=float,
+        default=0.10,
+        help=(
+            'Label smoothing ε applied to the softmax-CE branch only. '
+            '0.0 = plain cross-entropy. Default 0.10 (baseline v2).'
+        ),
+    )
+    parser.add_argument(
+        '--couple-hardneg-fraction',
+        type=float,
+        default=0.0,
+        help=(
+            'Fraction of negatives drawn from the current top-scoring '
+            'pool per event (ANCE / NV-Retriever online hard-negative '
+            'mining). 0 = all random (legacy). Typical: 0.5.'
+        ),
+    )
+    parser.add_argument(
+        '--couple-hardneg-margin',
+        type=float,
+        default=0.1,
+        help=(
+            'Positive-aware threshold for hard-negative filtering. A '
+            "candidate is kept only if its score is < s_pos − margin, "
+            'which prevents false negatives from being selected as hard '
+            'negatives.'
+        ),
+    )
+    parser.add_argument(
+        '--pair-kinematics-v2',
+        action='store_true',
+        help=(
+            'Append four extra per-couple features to the 51-dim feature '
+            'block: cos(opening angle), (m_ij − m_τ)/σ_m, '
+            'dxy_sig_i·dxy_sig_j, dz_sig_i·dz_sig_j. Bumps reranker '
+            'input_dim to 55.'
+        ),
+    )
+    parser.add_argument(
+        '--pair-physics-v3',
+        action='store_true',
+        help=(
+            'Batch-3 H8: 5 new per-couple features (Kalman-χ² proxy, '
+            'DCA-sig sum, lab helicity proxy, log BW densities for '
+            'ρ(770) and a1(1260)). Additive with --pair-kinematics-v2.'
+        ),
+    )
+    parser.add_argument(
+        '--pair-physics-signif',
+        action='store_true',
+        help=(
+            'Batch-4 H9: 3 significance-normalised pair features '
+            '(mass pull, Δφ significance, pT-balance significance). '
+            'Additive with other pair-physics flags.'
+        ),
+    )
+    parser.add_argument(
+        '--train-aug',
+        type=str,
+        default='none',
+        choices=['none', 'cov_smear'],
+        help=(
+            'Training-time input augmentation. "cov_smear" (Batch-3 H12) '
+            'perturbs kinematic track channels (px, py, pz, eta, phi) '
+            'per step with Gaussian noise whose σ scales as '
+            'exp(log_pt_err_standardized). See JetCLR (arXiv:2108.04253).'
+        ),
+    )
+    parser.add_argument(
+        '--smear-scale', type=float, default=1.0,
+        help='Scale factor for --train-aug cov_smear noise. Default 1.0.',
+    )
+    parser.add_argument(
+        '--drop-cov-features',
+        action='store_true',
+        help=(
+            'Zero out the 5 covariance/uncertainty track channels while '
+            '--train-aug cov_smear is active, so the model cannot detect '
+            'the smearing magnitude by reading σ directly. Recommended '
+            'whenever cov_smear is on.'
+        ),
+    )
+    parser.add_argument(
+        '--optim',
+        type=str,
+        default='adamw',
+        choices=['adamw', 'asam'],
+        help=(
+            'Base optimizer. "adamw" (default) is the current behavior. '
+            '"asam" wraps AdamW in scale-invariant adaptive SAM '
+            '(Kwon 2021, arXiv:2102.11600). Two forward-backward passes '
+            'per batch (~2x step cost). See Batch-3 H13.'
+        ),
+    )
+    parser.add_argument(
+        '--asam-rho', type=float, default=1.0,
+        help='ASAM perturbation radius. Default 1.0.',
+    )
+    parser.add_argument(
+        '--asam-eta', type=float, default=0.01,
+        help='ASAM scale offset η preventing div-by-zero on zero weights.',
+    )
+    parser.add_argument(
+        '--aux-vertex-weight', type=float, default=0.0,
+        help=(
+            'Weight of the auxiliary vertex-compatibility BCE head. '
+            '0.0 (default) disables the head. 0.5 = equal weight with '
+            'the primary ranking loss. See Batch-3 H7.'
+        ),
+    )
+    parser.add_argument(
+        '--event-context',
+        type=str,
+        default='none',
+        choices=['none', 'deepset_film'],
+        help=(
+            'Per-event context conditioner. "deepset_film" (Batch-3 H6) '
+            'pools the K2=60 per-track tensor (mean‖max‖std), projects to '
+            'context_dim, and FiLM-modulates the per-couple hidden '
+            'representation. Default off.'
+        ),
+    )
+    parser.add_argument(
+        '--context-dim', type=int, default=32,
+        help='Event-context projection width for --event-context deepset_film.',
+    )
+    parser.add_argument(
+        '--couple-embed-mode',
+        type=str,
+        default='projected_infersent',
+        choices=[
+            'concat', 'infersent', 'symmetric',
+            'bilinear_lrb', 'projected_infersent',
+            'ft_transformer', 'per_track_tokens',
+        ],
+        help=(
+            'How Block 1 of the couple feature tensor is reconstructed '
+            'before the Conv1d MLP. '
+            "'projected_infersent' (default, baseline v3) learns a "
+            "per-track projector φ(t) = LayerNorm(ReLU(Linear(16, p)(t))) "
+            'then applies InferSent on the projections; requires '
+            '--couple-projector-dim > 0. '
+            "'concat' keeps the raw [t_i ‖ t_j] (baseline v2). "
+            "'infersent' = [t_i, t_j, |t_i−t_j|, t_i⊙t_j] (Conneau 2017). "
+            "'symmetric' = [max, mean, |diff|] — permutation invariant. "
+            "'bilinear_lrb' appends (Ut_i)⊙(Vt_j) rank-8 interaction. "
+            "'ft_transformer' tokenises every input dim (feature-as-token) "
+            "and runs self-attention within each couple + [CLS] readout "
+            "(Gorishniy 2021, arXiv:2106.11959). "
+            "'per_track_tokens' is the same but with a learnable role "
+            "embedding distinguishing track-i / track-j / physics tokens."
+        ),
+    )
+    parser.add_argument(
+        '--tokenize-d', type=int, default=16,
+        help="Token width for ft_transformer / per_track_tokens modes.",
+    )
+    parser.add_argument(
+        '--tokenize-blocks', type=int, default=2,
+        help="Transformer depth for token modes.",
+    )
+    parser.add_argument(
+        '--tokenize-heads', type=int, default=4,
+        help="Attention heads for token modes. Must divide tokenize-d.",
+    )
+    parser.add_argument(
+        '--couple-projector-dim',
+        type=int,
+        default=32,
+        help=(
+            'Per-track projector width p used only when '
+            "--couple-embed-mode='projected_infersent'. Default 32 "
+            '(baseline v3). Set to 0 to disable the projector (must '
+            "also set --couple-embed-mode to something other than "
+            "'projected_infersent')."
+        ),
+    )
+    parser.add_argument(
+        '--couple-ema-decay',
+        type=float,
+        default=0.0,
+        help=(
+            'Exponential moving average decay for the couple reranker '
+            "weights. 0 = disabled (default). Typical: 0.999 (averages "
+            '~1000 updates). The EMA copy is BN-recalibrated at the end '
+            'of training and saved as best_model_ema_calibrated.pt.'
+        ),
+    )
+    parser.add_argument(
+        '--bn-calibration-steps',
+        type=int,
+        default=200,
+        help=(
+            'Number of forward-only training batches used to rebuild '
+            'the couple reranker BN running stats after training. 0 '
+            'disables the calibration step entirely (useful for smoke '
+            'tests).'
+        ),
+    )
     # K values for the validation metrics. The set of K values reported
     # for D@K_tracks (cascade-side) and C/RC@K_couples (reranker-side)
     # is configurable so sweeps can use a denser grid (e.g. step 10).
@@ -496,6 +805,19 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
     device = torch.device(args.device)
+
+    # Global seed seeding. Covers Python `random`, NumPy, PyTorch CPU and
+    # CUDA RNGs so that negative sampling in `CoupleReranker.compute_loss`
+    # (uses `torch.randint`) and dataset shuffling are reproducible across
+    # runs. When `--seed` is unset the RNGs stay at their default
+    # non-deterministic initialization.
+    if args.seed is not None:
+        import random as _random
+        import numpy as _numpy
+        _random.seed(args.seed)
+        _numpy.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # The selection criterion (best-checkpoint metric) is C@100_couples,
     # so K=100 must be present. Catch typos before any work happens.
@@ -634,6 +956,25 @@ def main():
         couple_dropout=args.couple_dropout,
         couple_ranking_num_samples=args.couple_ranking_num_samples,
         couple_ranking_temperature=args.couple_ranking_temperature,
+        couple_loss=args.couple_loss,
+        couple_label_smoothing=args.couple_label_smoothing,
+        couple_hardneg_fraction=args.couple_hardneg_fraction,
+        couple_hardneg_margin=args.couple_hardneg_margin,
+        pair_kinematics_v2=args.pair_kinematics_v2,
+        pair_physics_v3=args.pair_physics_v3,
+        pair_physics_signif=args.pair_physics_signif,
+        couple_embed_mode=args.couple_embed_mode,
+        couple_projector_dim=args.couple_projector_dim,
+        tokenize_d=args.tokenize_d,
+        tokenize_blocks=args.tokenize_blocks,
+        tokenize_heads=args.tokenize_heads,
+        ndcg_k=args.ndcg_k,
+        lambda_sigma=args.lambda_sigma,
+        couple_multi_positive=args.couple_multi_positive,
+        couple_use_full_negative_list=args.couple_use_full_negative_list,
+        aux_vertex_weight=args.aux_vertex_weight,
+        event_context=args.event_context,
+        context_dim=args.context_dim,
     )
     model = model.to(device)
 
@@ -654,6 +995,15 @@ def main():
     optimizer = torch.optim.AdamW(
         trainable_parameter_iter, lr=args.lr, weight_decay=args.weight_decay,
     )
+    if args.optim == 'asam':
+        from utils.sam_optimizer import SAM
+        optimizer = SAM(
+            optimizer, rho=args.asam_rho, eta=args.asam_eta, adaptive=True,
+        )
+        logger.info(
+            f'Wrapped optimizer in ASAM (rho={args.asam_rho}, '
+            f'eta={args.asam_eta}). Expected 2x step cost.'
+        )
 
     total_steps = args.epochs * steps_per_epoch
     max_warmup_steps = 2000
@@ -693,6 +1043,28 @@ def main():
         criterion_mode='max',
         criterion_name='C@100',
     )
+
+    # ---- Optional EMA (T2.3) ----
+    ema_model = None
+    if args.couple_ema_decay > 0.0:
+        if not 0.0 < args.couple_ema_decay < 1.0:
+            raise ValueError(
+                f'--couple-ema-decay must be in (0, 1), got '
+                f'{args.couple_ema_decay}',
+            )
+        decay = args.couple_ema_decay
+        ema_model = torch.optim.swa_utils.AveragedModel(
+            model.couple_reranker,
+            avg_fn=(
+                lambda averaged, current, n: (
+                    decay * averaged + (1.0 - decay) * current
+                )
+            ),
+        )
+        logger.info(
+            f'EMA enabled for couple_reranker (decay={decay}); '
+            'saved as best_model_ema_calibrated.pt after training.',
+        )
 
     # ---- TensorBoard ----
     from torch.utils.tensorboard import SummaryWriter
@@ -741,6 +1113,10 @@ def main():
                 tensorboard_writer, global_batch_count,
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
+                ema_model=ema_model,
+                train_aug=args.train_aug,
+                smear_scale=args.smear_scale,
+                drop_cov_features=args.drop_cov_features,
             )
 
             eval_steps = max(1, steps_per_epoch // 2)
@@ -845,13 +1221,21 @@ def main():
 
     # ---- Post-training BN calibration ----
     # Rebuild clean running stats so eval() mode works correctly.
-    logger.info('Calibrating CoupleReranker BN running stats...')
-    calibrate_reranker_batchnorm(
-        model, train_loader, device, data_config,
-        mask_input_index, label_input_index,
-        calibration_steps=200,
-    )
-    if check_batchnorm_health(model):
+    if args.bn_calibration_steps <= 0:
+        logger.info(
+            'BN calibration skipped (--bn-calibration-steps=0).',
+        )
+    else:
+        logger.info(
+            'Calibrating CoupleReranker BN running stats '
+            f'({args.bn_calibration_steps} steps)...',
+        )
+        calibrate_reranker_batchnorm(
+            model, train_loader, device, data_config,
+            mask_input_index, label_input_index,
+            calibration_steps=args.bn_calibration_steps,
+        )
+    if args.bn_calibration_steps > 0 and check_batchnorm_health(model):
         logger.info('BN calibration complete — all running stats are finite')
         # Save a final checkpoint with clean BN stats
         calibrated_checkpoint = {
@@ -871,8 +1255,56 @@ def main():
         )
         torch.save(calibrated_checkpoint, calibrated_path)
         logger.info(f'Saved calibrated checkpoint: {calibrated_path}')
-    else:
+    elif args.bn_calibration_steps > 0:
         logger.error('BN calibration failed — NaN in running stats!')
+
+    # ---- EMA (T2.3): swap in EMA weights, recalibrate BN on the EMA
+    # copy, validate, save separately. The live model is unaffected.
+    if ema_model is not None and args.bn_calibration_steps > 0:
+        logger.info('Swapping in EMA weights for BN recalibration + eval')
+        original_reranker_state = {
+            key: value.clone()
+            for key, value in model.couple_reranker.state_dict().items()
+        }
+        # swa_utils.AveragedModel wraps the averaged weights under
+        # `.module` in a way that matches the original state dict when
+        # loaded back into the live reranker.
+        ema_state = ema_model.module.state_dict()
+        model.couple_reranker.load_state_dict(ema_state)
+        calibrate_reranker_batchnorm(
+            model, train_loader, device, data_config,
+            mask_input_index, label_input_index,
+            calibration_steps=args.bn_calibration_steps,
+        )
+        if check_batchnorm_health(model):
+            ema_val_losses, ema_val_metrics = validate(
+                model, val_loader, device, data_config,
+                mask_input_index, label_input_index,
+                max_steps=max(1, steps_per_epoch // 2),
+                k_values_couples=tuple(args.k_values_couples),
+                k_values_tracks=tuple(args.k_values_tracks),
+            )
+            ema_c_at_100 = ema_val_metrics.get('c_at_100_couples', 0.0)
+            logger.info(f'EMA C@100 = {ema_c_at_100:.5f}')
+            ema_path = os.path.join(
+                checkpoints_dir, 'best_model_ema_calibrated.pt',
+            )
+            torch.save(
+                {
+                    'epoch': args.epochs,
+                    'couple_reranker_state_dict':
+                        model.couple_reranker.state_dict(),
+                    'ema_c_at_100': ema_c_at_100,
+                    'ema_val_metrics': ema_val_metrics,
+                    'args': vars(args),
+                },
+                ema_path,
+            )
+            logger.info(f'Saved EMA-calibrated checkpoint: {ema_path}')
+        else:
+            logger.error('EMA BN calibration failed — NaN in running stats')
+        # Restore the live (non-EMA) weights for downstream use.
+        model.couple_reranker.load_state_dict(original_reranker_state)
 
     logger.info(f'Training complete. Best C@100: {best_val_c_at_100:.5f}')
     logger.info(f'Experiment: {experiment_dir}')

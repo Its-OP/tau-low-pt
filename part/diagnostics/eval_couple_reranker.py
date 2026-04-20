@@ -62,6 +62,9 @@ def evaluate_batch(
     model: torch.nn.Module,
     model_inputs: tuple[torch.Tensor, ...],
     top_k_output_couples: int = 200,
+    pair_kinematics_v2: bool = False,
+    pair_physics_v3: bool = False,
+    pair_physics_signif: bool = False,
 ) -> list[dict]:
     """Run the couple reranker on one batch and return per-event results.
 
@@ -140,11 +143,18 @@ def evaluate_batch(
         top_k2_stage1_scores=k2_stage1_scores,
         top_k2_stage2_scores=k2_stage2_scores,
         top_k2_track_labels=k2_labels,
+        pair_kinematics_v2=pair_kinematics_v2,
+        pair_physics_v3=pair_physics_v3,
+        pair_physics_signif=pair_physics_signif,
     )
     couple_features = couple_inputs['couple_features']
     filter_a_mask = couple_inputs['filter_a_mask']
 
-    scores = model.couple_reranker(couple_features)  # (B, n_couples)
+    # Pass k2_features to support H6 event-context mode; unused for all
+    # other couple_embed_mode / event_context combinations.
+    scores = model.couple_reranker(
+        couple_features, k2_features=k2_features,
+    )  # (B, n_couples)
 
     # ---- Canonical couple indices within K2 ----
     couple_i, couple_j = torch.triu_indices(
@@ -343,19 +353,50 @@ def main(argv: list[str] | None = None) -> None:
         f'max steps: {max_steps}, workers: {args.num_workers}',
     )
 
-    # ---- Build model ----
-    network_module = load_network_module(args.network)
-    model, _ = network_module.get_model(
-        data_config_obj,
-        cascade_checkpoint=args.cascade_checkpoint,
-        top_k2=args.top_k2,
-    )
-    model = model.to(device)
-
-    # Load the slim couple-reranker weights
+    # ---- Load checkpoint first to recover training-time config ----
     checkpoint = torch.load(
         args.couple_checkpoint, map_location=device, weights_only=False,
     )
+    ckpt_args = checkpoint.get('args', {}) or {}
+
+    # Reranker architecture knobs that affect input_dim / param shape.
+    # Pulled from the checkpoint so eval doesn't need to mirror each
+    # training flag via CLI.
+    model_kwargs = {
+        'cascade_checkpoint': args.cascade_checkpoint,
+        'top_k2': args.top_k2,
+    }
+    for key in (
+        'couple_embed_mode', 'couple_projector_dim',
+        'pair_kinematics_v2', 'pair_physics_v3', 'pair_physics_signif',
+        'couple_hidden_dim', 'couple_num_residual_blocks',
+        'couple_dropout',
+        'couple_loss', 'couple_label_smoothing',
+        'couple_ranking_num_samples', 'couple_ranking_temperature',
+        'couple_hardneg_fraction', 'couple_hardneg_margin',
+        'tokenize_d', 'tokenize_blocks', 'tokenize_heads',
+        'event_context', 'context_dim',
+    ):
+        if key in ckpt_args:
+            model_kwargs[key] = ckpt_args[key]
+
+    # Feature-builder flags need to be threaded into evaluate_batch so the
+    # per-batch couple feature tensor has the right number of dims.
+    pair_kinematics_v2 = bool(ckpt_args.get('pair_kinematics_v2', False))
+    pair_physics_v3 = bool(ckpt_args.get('pair_physics_v3', False))
+    pair_physics_signif = bool(ckpt_args.get('pair_physics_signif', False))
+    logger.info(
+        f"Eval config from checkpoint: embed_mode="
+        f"{ckpt_args.get('couple_embed_mode', 'concat')}, "
+        f"projector_dim={ckpt_args.get('couple_projector_dim', 0)}, "
+        f"pair_kinematics_v2={pair_kinematics_v2}",
+    )
+
+    # ---- Build model ----
+    network_module = load_network_module(args.network)
+    model, _ = network_module.get_model(data_config_obj, **model_kwargs)
+    model = model.to(device)
+
     model.couple_reranker.load_state_dict(
         checkpoint['couple_reranker_state_dict'],
     )
@@ -409,6 +450,9 @@ def main(argv: list[str] | None = None) -> None:
         batch_results = evaluate_batch(
             model, model_inputs,
             top_k_output_couples=args.top_k_output_couples,
+            pair_kinematics_v2=pair_kinematics_v2,
+            pair_physics_v3=pair_physics_v3,
+            pair_physics_signif=pair_physics_signif,
         )
 
         # Attach event metadata and build both index + pT forms.
