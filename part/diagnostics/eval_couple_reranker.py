@@ -162,6 +162,25 @@ def evaluate_batch(
     )
 
     # ---- Per-event: sort, take top-K, map to original indices ----
+    # Top-256 prefilter tracks: sort stage1_scores desc, valid only, up to 256
+    stage1_scores_masked = filtered['stage1_scores'].clone()
+    stage1_scores_masked[~stage1_valid] = float('-inf')
+    stage1_sorted_positions = torch.argsort(
+        stage1_scores_masked, dim=1, descending=True,
+    )  # (B, K1) positions within K1
+
+    # Top-100 ParT tracks: stage2_scores are already -inf on invalid K1
+    # positions (CascadeReranker.forward masked_fill). Sort desc, take 100.
+    top100_part_in_k1 = stage2_scores.topk(
+        min(100, stage2_scores.shape[1]), dim=1,
+    ).indices  # (B, K_out)
+    top100_part_original = stage1_indices.gather(
+        1, top100_part_in_k1,
+    )  # (B, K_out) positions in original event
+    top100_part_scores = stage2_scores.gather(
+        1, top100_part_in_k1,
+    )  # (B, K_out)
+
     results: list[dict] = []
     for batch_index in range(batch_size):
         event_scores = scores[batch_index].clone()
@@ -185,13 +204,29 @@ def evaluate_batch(
             [track_i_original, track_j_original], dim=1,
         ).tolist()
 
-        # Remaining pions: valid Stage 1 tracks as original indices
+        # Top-256 prefilter: sorted by stage1 score, valid only, in original indices
         event_valid = stage1_valid[batch_index]
+        sorted_positions = stage1_sorted_positions[batch_index]
+        valid_sorted = sorted_positions[event_valid[sorted_positions]]
+        top256_prefilter = stage1_indices[
+            batch_index, valid_sorted[:256],
+        ].tolist()
+
+        # Top-100 ParT: filter -inf (padding) entries, already sorted
+        event_part_scores = top100_part_scores[batch_index]
+        valid_part_mask = torch.isfinite(event_part_scores)
+        top100_part = top100_part_original[
+            batch_index, valid_part_mask,
+        ].tolist()
+
+        # Remaining pions: valid Stage 1 tracks as original indices
         remaining = stage1_indices[batch_index, event_valid].tolist()
 
         results.append({
             'couples': couples,
             'remaining_pions': remaining,
+            'top256_prefilter': top256_prefilter,
+            'top100_part': top100_part,
         })
 
     return results
@@ -229,6 +264,18 @@ def write_results_parquet(
         'source_microbatch_id': pa.array(
             [r['source_microbatch_id'] for r in results_rows],
             type=pa.int32()),
+        'top_256_prefilter_indices': pa.array(
+            [r['top_256_prefilter_indices'] for r in results_rows],
+            type=pa.list_(pa.int32())),
+        'top_256_prefilter_pt': pa.array(
+            [r['top_256_prefilter_pt'] for r in results_rows],
+            type=pa.list_(pa.float32())),
+        'top_100_part_indices': pa.array(
+            [r['top_100_part_indices'] for r in results_rows],
+            type=pa.list_(pa.int32())),
+        'top_100_part_pt': pa.array(
+            [r['top_100_part_pt'] for r in results_rows],
+            type=pa.list_(pa.float32())),
         'couple_indices': pa.array(
             [r['couple_indices'] for r in results_rows],
             type=pa.list_(pa.list_(pa.int32()))),
@@ -412,29 +459,40 @@ def main(argv: list[str] | None = None) -> None:
     mask_input_index = input_names.index('pf_mask')
     label_input_index = input_names.index('pf_label')
 
-    # ---- Preload track_pt from source parquet ----
+    # ---- Preload track_pt from source parquet, keyed by composite key ----
     # Loaded separately (not as an observer) to avoid the overhead of
     # collating variable-length awkward arrays in every DataLoader batch.
-    # Positional matching with num_workers=0 guarantees alignment.
-    if args.num_workers != 0:
-        logger.warning(
-            'num_workers=%d but positional track_pt matching requires '
-            'num_workers=0. Forcing num_workers=0.', args.num_workers,
-        )
-        args.num_workers = 0
-    logger.info('Preloading track_pt from source parquet files...')
-    all_track_pt: list[list[float]] = []
+    # Keyed on (event_run, event_id, event_luminosity_block, source_batch_id,
+    # source_microbatch_id) so the dataloader's `selection` filter (drops
+    # events with event_n_tracks == 0) does not break alignment.
+    logger.info(
+        'Preloading track_pt from source parquet files (composite-key '
+        'indexed)...',
+    )
+    key_columns = [
+        'event_run', 'event_id', 'event_luminosity_block',
+        'source_batch_id', 'source_microbatch_id',
+    ]
+    track_pt_by_key: dict[tuple, list[float]] = {}
     for file_path in parquet_files:
-        file_table = pq.read_table(file_path, columns=['track_pt'])
+        file_table = pq.read_table(
+            file_path, columns=['track_pt', *key_columns],
+        )
+        key_cols = {k: file_table.column(k).to_pylist() for k in key_columns}
+        pt_col = file_table.column('track_pt').to_pylist()
         for row_index in range(file_table.num_rows):
-            all_track_pt.append(
-                file_table.column('track_pt')[row_index].as_py(),
+            key = (
+                int(key_cols['event_run'][row_index]),
+                int(key_cols['event_id'][row_index]),
+                int(key_cols['event_luminosity_block'][row_index]),
+                int(key_cols['source_batch_id'][row_index]),
+                int(key_cols['source_microbatch_id'][row_index]),
             )
-    logger.info(f'Preloaded track_pt for {len(all_track_pt)} events')
+            track_pt_by_key[key] = pt_col[row_index]
+    logger.info(f'Preloaded track_pt for {len(track_pt_by_key)} events')
 
     # ---- Evaluation loop ----
     all_results: list[dict] = []
-    global_event_offset = 0
     start_time = time.time()
 
     for batch_index, (X, _, Z) in enumerate(loader):
@@ -456,29 +514,67 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         # Attach event metadata and build both index + pT forms.
-        # pT comes from the preloaded track_pt arrays (positional match).
+        # pT comes from the preloaded track_pt dict, looked up by the event's
+        # composite key (not positional — the dataloader's selection filter
+        # drops events with zero tracks, which would otherwise break positional
+        # alignment).
         actual_batch_size = model_inputs[0].shape[0]
         labels_flat = track_labels.squeeze(1)  # (B, P)
         for event_index in range(actual_batch_size):
             result = batch_results[event_index]
-            event_pt = all_track_pt[global_event_offset + event_index]
+            event_key = (
+                int(Z['event_run'][event_index]),
+                int(Z['event_id'][event_index]),
+                int(Z['event_luminosity_block'][event_index]),
+                int(Z['source_batch_id'][event_index]),
+                int(Z['source_microbatch_id'][event_index]),
+            )
+            event_pt = track_pt_by_key.get(event_key)
+            if event_pt is None:
+                raise RuntimeError(
+                    f'No track_pt for event key {event_key} — composite key '
+                    f'preload missing this event.'
+                )
             n_tracks = len(event_pt)
 
             # Rename evaluate_batch output → index columns
             result['couple_indices'] = result.pop('couples')
             result['remaining_pion_indices'] = result.pop('remaining_pions')
+            result['top_256_prefilter_indices'] = result.pop('top256_prefilter')
+            result['top_100_part_indices'] = result.pop('top100_part')
 
             # Build pT columns from indices (skip out-of-range from
-            # batch padding artifacts)
+            # batch padding artifacts). pT comes from the preloaded
+            # track_pt list (source parquet input), not recovered from
+            # model tensors.
+            result['couple_indices'] = [
+                [idx_i, idx_j] for idx_i, idx_j in result['couple_indices']
+                if idx_i < n_tracks and idx_j < n_tracks
+            ]
             result['couple_pt'] = [
                 [event_pt[idx_i], event_pt[idx_j]]
                 for idx_i, idx_j in result['couple_indices']
-                if idx_i < n_tracks and idx_j < n_tracks
+            ]
+            result['remaining_pion_indices'] = [
+                idx for idx in result['remaining_pion_indices']
+                if idx < n_tracks
             ]
             result['remaining_pion_pt'] = [
-                event_pt[idx]
-                for idx in result['remaining_pion_indices']
+                event_pt[idx] for idx in result['remaining_pion_indices']
+            ]
+            result['top_256_prefilter_indices'] = [
+                idx for idx in result['top_256_prefilter_indices']
                 if idx < n_tracks
+            ]
+            result['top_256_prefilter_pt'] = [
+                event_pt[idx] for idx in result['top_256_prefilter_indices']
+            ]
+            result['top_100_part_indices'] = [
+                idx for idx in result['top_100_part_indices']
+                if idx < n_tracks
+            ]
+            result['top_100_part_pt'] = [
+                event_pt[idx] for idx in result['top_100_part_indices']
             ]
 
             # GT pions: both index and pT forms
@@ -504,8 +600,6 @@ def main(argv: list[str] | None = None) -> None:
             result['source_microbatch_id'] = int(
                 Z['source_microbatch_id'][event_index],
             )
-
-        global_event_offset += actual_batch_size
 
         all_results.extend(batch_results)
 

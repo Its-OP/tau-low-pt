@@ -128,12 +128,25 @@ def get_model(data_config, **kwargs):
     # Default to 16 for legacy checkpoints. Callers that trained with a
     # different k must override via kwargs['stage1_num_neighbors'].
     stage1_num_neighbors = kwargs.pop('stage1_num_neighbors', 16)
+
+    # Dropout>0 inserts nn.Dropout into the Sequential, shifting conv indices.
+    # Zero-dropout key pattern: track_mlp.3.weight is Conv1d (shape [C, C, 1]),
+    # track_mlp.4.weight is BatchNorm (shape [C]).
+    # Dropout>0 pattern: track_mlp.4.weight is Conv1d ([C, C, 1]) because the
+    # dropout module shifts indices by 1.
+    second_conv_weight = stage1_state.get('track_mlp.4.weight')
+    if second_conv_weight is not None and second_conv_weight.dim() == 3:
+        inferred_dropout = 0.1  # any >0 reproduces the layer layout
+    else:
+        inferred_dropout = 0.0
+
     _logger.info(
         f'Stage 1 config from checkpoint: hidden_dim={inferred_hidden_dim}, '
         f'input_dim={inferred_input_dim}, '
         f'num_message_rounds={inferred_num_message_rounds}, '
         f'use_edge_features={inferred_use_edge}, '
-        f'num_neighbors={stage1_num_neighbors}',
+        f'num_neighbors={stage1_num_neighbors}, '
+        f'dropout={inferred_dropout}',
     )
 
     stage1 = TrackPreFilter(
@@ -143,6 +156,7 @@ def get_model(data_config, **kwargs):
         num_message_rounds=inferred_num_message_rounds,
         num_neighbors=stage1_num_neighbors,
         use_edge_features=inferred_use_edge,
+        dropout=inferred_dropout,
     )
     stage1.load_state_dict(stage1_state)
     _logger.info('Stage 1 loaded successfully')

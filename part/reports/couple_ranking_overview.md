@@ -120,12 +120,6 @@ tried at Stage 3:
    the full val. Every metric is reported against the split that
    produced it; no cross-split claims are made.
 
-6. **Training budget**: a single vast.ai GPU (RTX PRO 6000 Blackwell,
-   102 GB VRAM, CUDA 13). Sequential, not parallel, experiments. 60
-   epochs at 200 steps × batch 96 ≈ 55 min per run. A 14-experiment
-   sweep takes ≈ 13 h wall-time and must survive SSH disconnects (runs
-   in a detached `screen` session).
-
 ---
 
 ## 4. Starting conditions — original baseline (v1)
@@ -154,7 +148,6 @@ Baseline v1 full-val metrics (52 452 events, K2 = 60, top-200 couples):
 | C@75 | 0.7765 |
 | **C@100** | **0.7881** |
 | C@200 | 0.8041 |
-| RC@100 | 0.6774 |
 | D@60_tracks (ceiling) | 0.8596 |
 | mean rank of best GT couple | 11.6 |
 | structural gap (D@60 − C@100) | 0.0715 (7.15 pp) |
@@ -711,73 +704,8 @@ An apparent third winner is under investigation as of the snapshot:
 
 ## 9. Outstanding questions visible in the data
 
-- **Train-time vs full-val offset of ~4 pp** is consistent across every
-  checkpoint and every batch. The train-time subset is the first
-  9 600 events of the val split, unshuffled. The offset is therefore
-  a property of where those events sit in the parquet ordering, not
-  a metric bug. Moving the train-time validator to a random subset
-  would align the two, but the current consistency is useful:
-  train-time ordering reliably predicts full-val ordering (Batch 1
-  confirmed this by full-val confirmation of the four train-time
-  positives).
-
-- **T2.3 EMA on its own checkpoint** — `best_model_ema_calibrated.pt`
-  has never been scored against val. The Batch-1-T2.3 row in all
-  tables reflects live weights only.
-
-- **D@K2_tracks drift across experiments** — varies from 0.8577 to
-  0.8645 across runs despite the identical frozen cascade. The
-  variation tracks which events fall into the train-time subset
-  (seed-dependent shuffling inside the DataLoader, which affects
-  which subset of val is measured). Noise of ~0.005 D@60 is
-  comparable in size to the label-smoothing gain, so all reranker
-  ΔC@100 claims are set inside per-subset-noise bars. Full-val
-  confirmations are necessary for any claim ≤ +0.003 ΔC@100.
-
 - **Structural headroom** — D@60_tracks ≈ 0.86 bounds C@100 above.
   Baseline v2 sits at 0.7914 full val, so 0.07 ≈ 7 pp is still
   unspent. This is a Stage-3 problem (the reranker is not
   retrieving the ≥ 2 GT pions that the cascade already delivers),
   not a Stage-1 or Stage-2 one.
-
----
-
-## 10. Experimental infrastructure
-
-For each experiment, the following is preserved:
-
-- `experiments/<run>/<name>/<name>_<timestamp>/training.log` —
-  complete stdout/stderr. Contains the `Arguments:` dict parsed by
-  the audit scripts.
-- `experiments/<run>/<name>/<name>_<timestamp>/metrics/epoch_<N>.json`
-  — per-epoch val metrics (C@K, RC@K, D@K, mean_rank, eligible,
-  full_triplet counts).
-- `experiments/<run>/<name>/<name>_<timestamp>/checkpoints/
-  best_model_calibrated.pt` — best-C@100 checkpoint with
-  post-training BN calibration on a 200-step pass. Carries the
-  `args` dict used at training time.
-- `experiments/<run>/sweep.log` — orchestrator log (start/finish
-  timestamps, exit codes).
-- `experiments/<run>/diagnostics.json` — post-hoc audit artefact.
-
-Audit procedure applied to every experiment, without exception:
-
-1. Parse `Arguments:` from `training.log` with `ast.literal_eval`.
-2. Compare against the expected non-default overrides for that
-   experiment; fail the run if any expected knob is missing or any
-   other knob drifted from baseline.
-3. Extract `CoupleReranker: <N> params` witness and cross-check
-   against the analytically predicted parameter count for the given
-   (embed_mode, projector_dim, hidden_dim, num_residual_blocks,
-   pair_kinematics_v2).
-4. Scan `metrics/epoch_*.json` for argmax of `val_c_at_100_couples`,
-   then cross-check against the tail-line `Training complete. Best
-   C@100:` reported by the training script. Diff must be < 1e-5.
-5. For experiments with `couple_ema_decay > 0`, verify
-   `best_model_ema_calibrated.pt` exists; for others, verify it does
-   not.
-6. Verify 60 (or 80) epoch JSONs exist.
-
-All 14 Batch 1 experiments and all 9 Batch 2 experiments passed this
-audit.
-
