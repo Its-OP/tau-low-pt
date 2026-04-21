@@ -95,17 +95,54 @@ def get_model(data_config, **kwargs):
             f'match data config input_dim={input_dim}. '
             f'Retrain Stage 1 on the current feature set.'
         )
+
+    # Infer num_message_rounds by counting neighbor_mlps.N.*
+    # Infer use_edge_features from neighbor_mlps.0.0.weight shape[1]:
+    # without edges: 2 * hidden_dim. With edges: 2 * hidden_dim + 4.
+    stage1_round_indices = {
+        int(k.split('.')[1]) for k in stage1_state
+        if k.startswith('neighbor_mlps.')
+    }
+    inferred_num_message_rounds = (
+        max(stage1_round_indices) + 1 if stage1_round_indices else 0
+    )
+    first_neighbor_weight = stage1_state.get('neighbor_mlps.0.0.weight')
+    if first_neighbor_weight is not None:
+        neighbor_in_dim = first_neighbor_weight.shape[1]
+        expected_no_edges = 2 * inferred_hidden_dim
+        if neighbor_in_dim == expected_no_edges:
+            inferred_use_edge = False
+        elif neighbor_in_dim == expected_no_edges + 4:
+            inferred_use_edge = True
+        else:
+            raise ValueError(
+                f'Cannot infer use_edge_features: neighbor_mlps.0.0 '
+                f'in_dim={neighbor_in_dim}, expected '
+                f'{expected_no_edges} (no edges) or '
+                f'{expected_no_edges + 4} (edges)',
+            )
+    else:
+        inferred_use_edge = False
+
+    # num_neighbors is NOT recoverable from state dict (runtime-only kNN k).
+    # Default to 16 for legacy checkpoints. Callers that trained with a
+    # different k must override via kwargs['stage1_num_neighbors'].
+    stage1_num_neighbors = kwargs.pop('stage1_num_neighbors', 16)
     _logger.info(
-        f'Stage 1 config from checkpoint: '
-        f'hidden_dim={inferred_hidden_dim}, input_dim={inferred_input_dim}'
+        f'Stage 1 config from checkpoint: hidden_dim={inferred_hidden_dim}, '
+        f'input_dim={inferred_input_dim}, '
+        f'num_message_rounds={inferred_num_message_rounds}, '
+        f'use_edge_features={inferred_use_edge}, '
+        f'num_neighbors={stage1_num_neighbors}',
     )
 
     stage1 = TrackPreFilter(
         mode='mlp',
         input_dim=inferred_input_dim,
         hidden_dim=inferred_hidden_dim,
-        num_message_rounds=2,
-        num_neighbors=16,
+        num_message_rounds=inferred_num_message_rounds,
+        num_neighbors=stage1_num_neighbors,
+        use_edge_features=inferred_use_edge,
     )
     stage1.load_state_dict(stage1_state)
     _logger.info('Stage 1 loaded successfully')

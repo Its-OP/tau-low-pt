@@ -500,6 +500,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--network', type=str, required=True)
     parser.add_argument('--stage1-checkpoint', type=str, required=True,
                         help='Path to trained Stage 1 (TrackPreFilter) checkpoint')
+    parser.add_argument('--stage1-num-neighbors', type=int, default=16,
+                        help='kNN k for frozen Stage 1 (must match training k; '
+                             'not inferable from state dict)')
     parser.add_argument('--top-k1', type=int, default=256,
                         help='Number of tracks to pass from Stage 1 to Stage 2')
     parser.add_argument('--model-name', type=str, default='Cascade')
@@ -708,6 +711,7 @@ def main():
     model, model_info = network_module.get_model(
         data_config,
         stage1_checkpoint=args.stage1_checkpoint,
+        stage1_num_neighbors=args.stage1_num_neighbors,
         top_k1=args.top_k1,
         stage2_embed_dim=args.stage2_embed_dim,
         stage2_num_heads=args.stage2_num_heads,
