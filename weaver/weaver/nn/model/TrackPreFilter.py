@@ -659,47 +659,62 @@ class TrackPreFilter(nn.Module):
             edge_features_per_neighbor = None
             edge_max_pooled = None
 
+        # Neighbour validity is derived from the forward-invariant mask
+        # and the forward-invariant k-NN indices, so it's the same for
+        # every message-passing round. Gather it ONCE before the loop
+        # — previously the gather (and its scatter_add_ backward at
+        # ~14.5% CUDA per profile) fired every round redundantly.
+        neighbor_validity = cross_set_gather(mask_float, neighbor_indices)
+        # Pre-compute the validity == 0 boolean mask (also round-
+        # invariant) — the max-pool and soft-attention paths both
+        # need it, and building it once instead of per-round eliminates
+        # a (B, 1, P, K) elementwise_kernel per round.
+        neighbor_invalid = neighbor_validity == 0
+
         # Multi-round message passing
         current = track_embedding
         for round_index in range(self.num_message_rounds):
             neighbor_features = cross_set_gather(
                 current, neighbor_indices,
             )
-            neighbor_validity = cross_set_gather(
-                mask.float(), neighbor_indices,
-            )
 
             if self.aggregation_mode == 'pna':
                 # PNA: cat([current, mean, max, min, std]) → (B, 5*H, P)
-                pna_aggregated = self._pna_aggregate(
+                pooled = self._pna_aggregate(
                     neighbor_features, neighbor_validity,
                 )
-                aggregated = torch.cat([current, pna_aggregated], dim=1)
             elif self.soft_attention_aggregators is not None:
                 # P4: learned soft-attention pooling replaces max-pool.
                 # Edge features flow as input to the score MLP (per-
                 # neighbour (B, 4, P, K) tensor); the attention-pooled
                 # output keeps shape (B, H, P), same as max-pool.
-                attention_pooled = self.soft_attention_aggregators[round_index](
+                pooled = self.soft_attention_aggregators[round_index](
                     current,
                     neighbor_features,
                     neighbor_validity,
                     edge_features_per_neighbor,
                 )
-                aggregated = torch.cat([current, attention_pooled], dim=1)
             else:
-                # Standard max-pool: cat([current, max_pooled]) → (B, 2*H, P)
-                neighbor_features = neighbor_features.masked_fill(
-                    neighbor_validity == 0, float('-inf'),
+                # Standard max-pool. In-place masked_fill_ avoids an
+                # extra allocation — ``neighbor_features`` is not used
+                # downstream. Guard all-invalid rows with torch.where so
+                # a -inf max doesn't leak into the neighbor_mlp.
+                neighbor_features.masked_fill_(neighbor_invalid, float('-inf'))
+                pooled = neighbor_features.max(dim=-1)[0]
+                pooled = torch.where(
+                    torch.isfinite(pooled),
+                    pooled,
+                    pooled.new_zeros(()),
                 )
-                max_pooled = neighbor_features.max(dim=-1)[0]
-                max_pooled = max_pooled.masked_fill(
-                    max_pooled == float('-inf'), 0.0,
-                )
-                aggregated = torch.cat([current, max_pooled], dim=1)
 
+            # Single cat instead of two sequential cats — removes one
+            # CatArrayBatched kernel launch per round.
             if edge_max_pooled is not None:
-                aggregated = torch.cat([aggregated, edge_max_pooled], dim=1)
+                aggregated = torch.cat(
+                    [current, pooled, edge_max_pooled], dim=1,
+                )
+            else:
+                aggregated = torch.cat([current, pooled], dim=1)
 
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
