@@ -124,12 +124,15 @@ declare -A NETWORK_FAMILY=(
     [P6]="two_tier"
 )
 declare -A EXPERIMENT_ARGS=(
-    [E2a_anchor]="--use-edge-features --num-neighbors 16 --num-message-rounds 3"
-    [P1]="--use-edge-features --num-neighbors 16 --num-message-rounds 3 --feature-embed-mode per_feature --feature-embed-dim 32"
-    [P2]="--use-edge-features --num-neighbors 16 --num-message-rounds 3 --feature-gate --feature-gate-bottleneck 16"
-    [P3]="--use-edge-features --num-neighbors 16 --num-message-rounds 3 --film-head --film-context-dim 32"
-    [P4]="--use-edge-features --num-neighbors 16 --num-message-rounds 3 --soft-attention-aggregation --soft-attention-bottleneck 64"
-    [P6]="--use-edge-features --two-tier-top-n 600 --two-tier-coarse-hidden-dim 128 --two-tier-refine-hidden-dim 384 --two-tier-coarse-neighbors 16 --two-tier-refine-neighbors 32 --two-tier-coarse-rounds 2 --two-tier-refine-rounds 3"
+    # Rely on train_prefilter.py + wrapper defaults for the E2a baseline
+    # (edges ON, k=16, r=3, dropout=0.1) — see commit 1363bef. Each
+    # follow-up row lists ONLY what it changes on top of that baseline.
+    [E2a_anchor]=""
+    [P1]="--feature-embed-mode per_feature --feature-embed-dim 32"
+    [P2]="--feature-gate --feature-gate-bottleneck 16"
+    [P3]="--film-head --film-context-dim 32"
+    [P4]="--soft-attention-aggregation --soft-attention-bottleneck 64"
+    [P6]="--two-tier-top-n 600 --two-tier-coarse-hidden-dim 128 --two-tier-refine-hidden-dim 384 --two-tier-coarse-neighbors 16 --two-tier-refine-neighbors 32 --two-tier-coarse-rounds 2 --two-tier-refine-rounds 3"
 )
 
 # Scheduling order — cheapest / lowest-risk first.
