@@ -213,6 +213,9 @@ class TwoTierPreFilter(nn.Module):
         return {
             'ranking_loss': ranking_loss,
             'total_loss': ranking_loss,
+            # Raw composite scores — popped by train_prefilter's
+            # ``validate`` path to feed the MetricsAccumulator.
+            '_scores': scores,
         }
 
     # --- Schedule pass-throughs -------------------------------------------
