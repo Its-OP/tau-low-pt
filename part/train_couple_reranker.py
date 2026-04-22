@@ -152,6 +152,7 @@ def train_one_epoch(
     train_aug: str = 'none',
     smear_scale: float = 1.0,
     drop_cov_features: bool = False,
+    grad_scaler: 'torch.amp.GradScaler | None' = None,
 ) -> tuple[dict[str, float], int]:
     """Train the CoupleReranker for one epoch (frozen cascade inside)."""
     model.train()
@@ -159,6 +160,14 @@ def train_one_epoch(
     num_batches = 0
     non_finite_batches = 0
     start_time = time.time()
+    # Per-batch (loss, mean_first_gt_rank_couples) samples for the
+    # position-aware diagnostic: Spearman ρ between these two signals
+    # quantifies whether the training loss tracks ranking quality. A
+    # loss that converges to low values while mean_gt_rank stays large
+    # (or grows) produces ρ near 0, signalling the loss is not
+    # discriminating on rank position.
+    batch_loss_samples: list[float] = []
+    batch_mean_gt_rank_samples: list[float] = []
 
     for batch_index, (X, _, _) in enumerate(train_loader):
         if batch_index >= steps_per_epoch:
@@ -193,9 +202,30 @@ def train_one_epoch(
                 features = _drop_cov_features(features)
 
         optimizer.zero_grad(set_to_none=True)
-        loss_dict = model.compute_loss(
-            points, features, lorentz_vectors, mask, track_labels,
-        )
+        # AMP: when grad_scaler is provided, run forward under autocast
+        # so the frozen cascade (ParT attention is the main compute
+        # cost) runs in fp16. The couple reranker is small enough that
+        # its fp32 gradient path remains numerically stable with the
+        # standard GradScaler.
+        with torch.amp.autocast('cuda', enabled=grad_scaler is not None):
+            loss_dict = model.compute_loss(
+                points, features, lorentz_vectors, mask, track_labels,
+            )
+        # Capture train-time mean_first_gt_rank_couples BEFORE the
+        # heavy metric tensors are popped. Position-aware diagnostic:
+        # batch-average rank of the best GT couple, computed the same
+        # way as the val metric (CoupleMetricsAccumulator).
+        with torch.no_grad():
+            scores_t = loss_dict.get('_scores')
+            labels_t = loss_dict.get('_couple_labels')
+            mask_t = loss_dict.get('_couple_mask')
+            if scores_t is not None and labels_t is not None and mask_t is not None:
+                batch_mean_rank = _compute_batch_mean_first_gt_rank(
+                    scores_t, labels_t, mask_t,
+                )
+                if batch_mean_rank is not None:
+                    batch_mean_gt_rank_samples.append(batch_mean_rank)
+                    batch_loss_samples.append(float(loss_dict['total_loss'].item()))
         # Drop the heavy metric tensors so the loss accumulator only sees
         # scalar loss components.
         loss_dict.pop('_scores', None)
@@ -216,7 +246,10 @@ def train_one_epoch(
             global_batch_count += 1
             continue
 
-        loss.backward()
+        if grad_scaler is not None:
+            grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # SAM / ASAM: do a second forward-backward pass at the
         # gradient-ascent-perturbed weights, then step with the second
@@ -248,12 +281,18 @@ def train_one_epoch(
                 )
             optimizer.second_step(zero_grad=True)
         else:
+            if grad_scaler is not None:
+                grad_scaler.unscale_(optimizer)
             if grad_clip_max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     filter(lambda p: p.requires_grad, model.parameters()),
                     grad_clip_max_norm,
                 )
-            optimizer.step()
+            if grad_scaler is not None:
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                optimizer.step()
         scheduler.step_batch()
         if ema_model is not None:
             ema_model.update_parameters(model.couple_reranker)
@@ -295,7 +334,86 @@ def train_one_epoch(
         f'Epoch {epoch} train | total: {loss_averages["total_loss"]:.5f}',
     )
     loss_averages['non_finite_batches'] = float(non_finite_batches)
+
+    # Position-aware diagnostic: train-time mean rank of the best GT
+    # couple, plus Spearman ρ between batch loss and batch mean rank.
+    # ρ close to +1 means loss tracks ranking quality (higher loss ⇔
+    # worse rank, which is what we want). ρ near 0 means the loss is
+    # position-insensitive at this operating point.
+    if batch_mean_gt_rank_samples:
+        mean_gt_rank_avg = float(
+            sum(batch_mean_gt_rank_samples)
+            / len(batch_mean_gt_rank_samples),
+        )
+        loss_averages['mean_first_gt_rank_train'] = mean_gt_rank_avg
+        # Restrict correlation to the final portion of the epoch: the
+        # warmup phase has loss collapsing while ranks don't stabilise,
+        # which inflates ρ artificially. Use last 50% of batches.
+        tail_start = len(batch_loss_samples) // 2
+        tail_losses = batch_loss_samples[tail_start:]
+        tail_ranks = batch_mean_gt_rank_samples[tail_start:]
+        rho = _spearman_rho(tail_losses, tail_ranks)
+        loss_averages['loss_rank_spearman_rho'] = rho
+        logger.info(
+            f'Epoch {epoch} train | mean_first_gt_rank_train: '
+            f'{mean_gt_rank_avg:.3f} | ρ(loss, rank): {rho:+.3f} '
+            f'(last {len(tail_losses)} batches)',
+        )
+
     return loss_averages, global_batch_count
+
+
+def _compute_batch_mean_first_gt_rank(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> float | None:
+    """Batch-average 1-indexed rank of the best GT couple.
+
+    Returns None if no event in the batch has a GT couple among its
+    valid candidates (so the caller can skip the (loss, rank) sample).
+    Matches the semantics of ``CoupleMetricsAccumulator`` for
+    ``mean_first_gt_rank_couples``.
+    """
+    batch_size = scores.shape[0]
+    ranks: list[float] = []
+    for batch_index in range(batch_size):
+        valid_mask = mask[batch_index] > 0.5
+        if not valid_mask.any():
+            continue
+        gt_mask = (labels[batch_index] > 0.5) & valid_mask
+        if not gt_mask.any():
+            continue
+        event_scores = scores[batch_index].clone()
+        event_scores = event_scores.masked_fill(
+            ~valid_mask, float('-inf'),
+        )
+        sorted_indices = torch.argsort(event_scores, descending=True)
+        sorted_gt = gt_mask[sorted_indices]
+        first_gt_position = int(sorted_gt.float().argmax().item())
+        ranks.append(float(first_gt_position + 1))
+    if not ranks:
+        return None
+    return sum(ranks) / len(ranks)
+
+
+def _spearman_rho(xs: list[float], ys: list[float]) -> float:
+    """Spearman rank correlation between two equal-length samples.
+
+    Returns 0.0 if fewer than 3 samples or if either list has no
+    variance (all identical values).
+    """
+    if len(xs) != len(ys) or len(xs) < 3:
+        return 0.0
+    try:
+        from scipy.stats import spearmanr
+    except ImportError:
+        return 0.0
+    stat = spearmanr(xs, ys).statistic
+    if stat is None:
+        return 0.0
+    import math
+    return 0.0 if math.isnan(stat) else float(stat)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +620,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--no-in-memory', action='store_true')
+    parser.add_argument(
+        '--amp', action='store_true',
+        help=(
+            'Enable mixed-precision training. Forward runs in fp16 under '
+            'autocast (frozen cascade kernel fusion benefits most); '
+            'backward uses GradScaler. Incompatible with SAM/ASAM '
+            'optimizer paths (silently disabled there).'
+        ),
+    )
     parser.add_argument('--steps-per-epoch', type=int, default=None)
     parser.add_argument('--save-every', type=int, default=5)
     parser.add_argument('--keep-best-k', type=int, default=5)
@@ -521,14 +648,17 @@ def _build_parser() -> argparse.ArgumentParser:
         '--couple-loss',
         type=str,
         default='softmax-ce',
-        choices=['pairwise', 'softmax-ce', 'lambda_ndcg2pp'],
+        choices=['pairwise', 'softmax-ce', 'lambda_ndcg2pp', 'approx_ndcg'],
         help=(
             "Couple-reranker loss branch. 'pairwise' = softplus pairwise "
             "ranking (legacy). 'softmax-ce' = listwise softmax "
             "cross-entropy (ListMLE top-1), default baseline v2. "
             "'lambda_ndcg2pp' = LambdaLoss NDCG-Loss2++ pair-weighting "
-            "with K-truncation (Wang 2018, arXiv:1811.04768); "
-            "directly optimises NDCG@K ranking metric."
+            "with optional K-truncation (Wang 2018, arXiv:1811.04768); "
+            "directly optimises NDCG@K ranking metric. 'approx_ndcg' = "
+            "smooth differentiable NDCG via sigmoid rank approximation "
+            "(Qin, Liu, Li 2010). Position-aware across the full list, "
+            "no K-truncation, no negative sampling."
         ),
     )
     parser.add_argument(
@@ -536,7 +666,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Top-K truncation for --couple-loss lambda_ndcg2pp. "
             "Pairs whose BOTH ranks exceed K are dropped from the sum. "
-            "Default 100 (matches the C@100 operating metric)."
+            "Default 100 (matches the C@100 operating metric). Set to 0 "
+            "to disable truncation (recommended when tail pairs still "
+            "carry useful gradient via the log-discount decay)."
         ),
     )
     parser.add_argument(
@@ -544,6 +676,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "RankNet sigmoid scale for the lambda_ndcg2pp loss. "
             "Higher = sharper swap penalty. Default 1.0."
+        ),
+    )
+    parser.add_argument(
+        '--ndcg-alpha', type=float, default=5.0,
+        help=(
+            "Sigmoid sharpness for --couple-loss approx_ndcg. Controls "
+            "the approximation quality of the rank estimate: as alpha "
+            "grows, rank(i) ≈ true rank; at alpha → 0 the sigmoid is "
+            "flat and the loss loses discriminative power. Default 5.0."
         ),
     )
     parser.add_argument(
@@ -970,6 +1111,7 @@ def main():
         tokenize_heads=args.tokenize_heads,
         ndcg_k=args.ndcg_k,
         lambda_sigma=args.lambda_sigma,
+        ndcg_alpha=args.ndcg_alpha,
         couple_multi_positive=args.couple_multi_positive,
         couple_use_full_negative_list=args.couple_use_full_negative_list,
         aux_vertex_weight=args.aux_vertex_weight,
@@ -1103,6 +1245,18 @@ def main():
 
     logger.info(f'=== Training CoupleReranker (top_k2={args.top_k2}) ===')
 
+    # AMP GradScaler — None disables the AMP path. SAM/ASAM second-pass
+    # forward cannot be easily mixed with GradScaler so --amp is
+    # silently force-disabled there to keep the SAM code path clean.
+    if args.amp and args.optim == 'asam':
+        logger.warning(
+            '--amp is incompatible with --optim asam; disabling AMP.',
+        )
+        args.amp = False
+    grad_scaler = torch.amp.GradScaler('cuda') if args.amp else None
+    if args.amp:
+        logger.info('AMP enabled (fp16 forward + GradScaler backward).')
+
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             logger.info(f'=== Epoch {epoch}/{args.epochs} ===')
@@ -1117,6 +1271,7 @@ def main():
                 train_aug=args.train_aug,
                 smear_scale=args.smear_scale,
                 drop_cov_features=args.drop_cov_features,
+                grad_scaler=grad_scaler,
             )
 
             eval_steps = max(1, steps_per_epoch // 2)
@@ -1165,6 +1320,20 @@ def main():
                     f'Metrics/val_{metric_key}', metric_value, epoch,
                 )
             tensorboard_writer.add_scalar('LR/epoch', current_lr, epoch)
+            # Position-aware diagnostics (Batch 6 — see
+            # couple_reranker_phase_c_proposal.md / cascade_full_val_results_20260421.md):
+            # train-time mean rank of the best GT couple and the
+            # Spearman correlation ρ between batch loss and that rank.
+            if 'mean_first_gt_rank_train' in train_losses:
+                tensorboard_writer.add_scalar(
+                    'Metrics/mean_first_gt_rank_train',
+                    train_losses['mean_first_gt_rank_train'], epoch,
+                )
+            if 'loss_rank_spearman_rho' in train_losses:
+                tensorboard_writer.add_scalar(
+                    'Metrics/loss_rank_spearman_rho',
+                    train_losses['loss_rank_spearman_rho'], epoch,
+                )
 
             loss_history['train'].append(train_losses['total_loss'])
             loss_history['val'].append(val_loss)

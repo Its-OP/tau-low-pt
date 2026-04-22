@@ -1006,6 +1006,192 @@ class TestLambdaNDCGLoss:
         ).item()
         assert abs(loss_a - loss_b) < 1e-5
 
+    def test_ndcg_K_zero_disables_truncation(self):
+        """ndcg_K=0 means 'no truncation' — all pairs contribute. Loss
+        should be >= the loss with a small K where far pairs are dropped."""
+        torch.manual_seed(0)
+        scores = torch.zeros(1, 50)
+        scores[0, 0] = 1.0  # GT at rank 1
+        scores[0, 45] = 0.5  # GT at rank ~5 (high)
+        scores[0, 10:40] = -1.0  # negatives spread out
+        labels = torch.zeros(1, 50)
+        labels[:, 0] = 1.0
+        labels[:, 45] = 1.0
+        mask = torch.ones(1, 50)
+
+        m_noK = CoupleReranker(couple_loss='lambda_ndcg2pp', ndcg_K=0)
+        m_K3 = CoupleReranker(couple_loss='lambda_ndcg2pp', ndcg_K=3)
+        loss_noK = m_noK._lambda_ndcg_loss(scores, labels, mask).item()
+        loss_K3 = m_K3._lambda_ndcg_loss(scores, labels, mask).item()
+        # No-truncation loss sums over strictly more pairs ⇒ ≥ truncated.
+        assert loss_noK >= loss_K3 - 1e-6
+
+    def test_rank_swap_increases_loss(self):
+        """Monotonic rank sensitivity: pushing GT from rank 5 to rank 30
+        must strictly increase the loss (position-aware signal)."""
+        model = CoupleReranker(couple_loss='lambda_ndcg2pp', ndcg_K=0)
+        n = 50
+        # Scenario A: GT at rank ~5 among 50 tracks.
+        scores_a = torch.arange(n, 0, -1).float().unsqueeze(0)  # descending
+        labels = torch.zeros(1, n)
+        labels[:, 4] = 1.0  # single GT at index 4 (rank 5)
+        mask = torch.ones(1, n)
+        # Scenario B: same config but GT moved to index 29 (rank 30).
+        scores_b = scores_a.clone()
+        labels_b = torch.zeros(1, n)
+        labels_b[:, 29] = 1.0
+        loss_a = model._lambda_ndcg_loss(scores_a, labels, mask).item()
+        loss_b = model._lambda_ndcg_loss(scores_b, labels_b, mask).item()
+        assert loss_b > loss_a, (
+            f'expected worse rank ⇒ larger loss, got a={loss_a:.4f}, '
+            f'b={loss_b:.4f}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# ApproxNDCG loss (Qin et al. 2010, Batch 6 — Batch 6 position-aware fix)
+# ---------------------------------------------------------------------------
+
+class TestApproxNDCGLoss:
+    def test_constructor_accepts_approx_ndcg_loss_name(self):
+        model = CoupleReranker(couple_loss='approx_ndcg')
+        assert model.couple_loss == 'approx_ndcg'
+
+    def test_loss_dict_shape(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='approx_ndcg')
+        features = torch.randn(2, 51, 30)
+        labels = torch.zeros(2, 30)
+        labels[:, 0] = 1.0
+        labels[:, 5] = 1.0
+        mask = torch.ones(2, 30)
+        out = model.compute_loss(features, labels, mask)
+        assert 'total_loss' in out
+        assert 'ranking_loss' in out
+        assert out['total_loss'].dim() == 0
+        assert torch.isfinite(out['total_loss'])
+
+    def test_gradient_flow(self):
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='approx_ndcg')
+        features = torch.randn(2, 51, 30)
+        labels = torch.zeros(2, 30)
+        labels[:, 0] = 1.0
+        mask = torch.ones(2, 30)
+        out = model.compute_loss(features, labels, mask)
+        out['total_loss'].backward()
+        grad_sums = [
+            p.grad.abs().sum().item()
+            for p in model.parameters()
+            if p.grad is not None
+        ]
+        assert any(g > 0 for g in grad_sums)
+
+    def test_perfect_ranking_gives_minimum_loss(self):
+        """GT couples scored strictly highest ⇒ NDCG ≈ 1 ⇒ loss ≈ −1.
+
+        Strict ordering (10, 9, 8) avoids tie-induced mid-ranks from the
+        sigmoid-at-zero branch; with ties at the top, ApproxNDCG assigns
+        approx_rank ≈ 2 for each tied position and NDCG drops slightly.
+        The test checks rank recovery, not tie-breaking semantics.
+        """
+        model = CoupleReranker(couple_loss='approx_ndcg', ndcg_alpha=5.0)
+        scores = torch.zeros(1, 10)
+        scores[0, 0] = 12.0
+        scores[0, 1] = 11.0
+        scores[0, 2] = 10.0
+        scores[0, 3:] = -10.0
+        labels = torch.zeros(1, 10)
+        labels[:, :3] = 1.0
+        mask = torch.ones(1, 10)
+        loss = model._approx_ndcg_loss(scores, labels, mask).item()
+        # Perfect: NDCG ~1.0 so loss = −NDCG ~= −1.0
+        assert loss < -0.99
+
+    def test_worst_ranking_gives_higher_loss_than_perfect(self):
+        model = CoupleReranker(couple_loss='approx_ndcg', ndcg_alpha=5.0)
+        n = 10
+        # Perfect: GT at top 3
+        scores_perfect = torch.tensor(
+            [[10., 9., 8.] + [-10.] * 7],
+        )
+        # Worst: GT at bottom 3
+        scores_worst = torch.tensor(
+            [[10.] * 7 + [-8., -9., -10.]],
+        )
+        labels_perfect = torch.zeros(1, n)
+        labels_perfect[:, :3] = 1.0
+        labels_worst = torch.zeros(1, n)
+        labels_worst[:, -3:] = 1.0
+        mask = torch.ones(1, n)
+        loss_p = model._approx_ndcg_loss(
+            scores_perfect, labels_perfect, mask,
+        ).item()
+        loss_w = model._approx_ndcg_loss(
+            scores_worst, labels_worst, mask,
+        ).item()
+        assert loss_w > loss_p
+
+    def test_rank_perturbation_strictly_monotonic(self):
+        """Pushing a GT couple from rank 5 down to rank 30 must strictly
+        increase ApproxNDCG loss (position-aware signal over full range)."""
+        torch.manual_seed(0)
+        n = 50
+        model = CoupleReranker(couple_loss='approx_ndcg', ndcg_alpha=5.0)
+        # descending scores → index = rank − 1
+        scores = torch.arange(n, 0, -1).float().unsqueeze(0)
+        mask = torch.ones(1, n)
+        labels_rank5 = torch.zeros(1, n)
+        labels_rank5[:, 4] = 1.0
+        labels_rank30 = torch.zeros(1, n)
+        labels_rank30[:, 29] = 1.0
+        loss_5 = model._approx_ndcg_loss(scores, labels_rank5, mask).item()
+        loss_30 = model._approx_ndcg_loss(scores, labels_rank30, mask).item()
+        assert loss_30 > loss_5
+
+    def test_ignores_padded_positions(self):
+        """Masked positions contribute zero to the loss."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='approx_ndcg')
+        scores = torch.randn(1, 20)
+        labels = torch.zeros(1, 20)
+        labels[:, 0] = 1.0
+        labels[:, 1] = 1.0
+        mask = torch.ones(1, 20)
+        mask[:, 10:] = 0.0
+
+        scores_pad_changed = scores.clone()
+        scores_pad_changed[:, 10:] = scores[:, 10:] + 100.0
+
+        loss_a = model._approx_ndcg_loss(scores, labels, mask).item()
+        loss_b = model._approx_ndcg_loss(
+            scores_pad_changed, labels, mask,
+        ).item()
+        assert abs(loss_a - loss_b) < 1e-4
+
+    def test_loss_in_expected_range(self):
+        """NDCG ∈ [0, 1] ⇒ loss = −NDCG ∈ [−1, 0]."""
+        torch.manual_seed(0)
+        model = CoupleReranker(couple_loss='approx_ndcg')
+        scores = torch.randn(4, 30)
+        labels = torch.zeros(4, 30)
+        labels[:, 0] = 1.0
+        labels[:, 1] = 1.0
+        labels[:, 2] = 1.0
+        mask = torch.ones(4, 30)
+        loss = model._approx_ndcg_loss(scores, labels, mask).item()
+        assert -1.0 - 1e-4 <= loss <= 0.0 + 1e-4, f'got {loss}'
+
+    def test_ndcg_alpha_default_and_validation(self):
+        model_default = CoupleReranker(couple_loss='approx_ndcg')
+        assert model_default.ndcg_alpha == 5.0
+        model_tuned = CoupleReranker(
+            couple_loss='approx_ndcg', ndcg_alpha=10.0,
+        )
+        assert model_tuned.ndcg_alpha == 10.0
+        with pytest.raises(ValueError, match='ndcg_alpha'):
+            CoupleReranker(couple_loss='approx_ndcg', ndcg_alpha=-1.0)
+
 
 # ---------------------------------------------------------------------------
 # Multi-positive soft target for softmax-CE (Batch 3 — H2)

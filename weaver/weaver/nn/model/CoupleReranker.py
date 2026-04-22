@@ -339,6 +339,7 @@ class CoupleReranker(nn.Module):
         hardneg_margin: float = 0.1,
         ndcg_K: int = 100,
         lambda_sigma: float = 1.0,
+        ndcg_alpha: float = 5.0,
         multi_positive: str = 'none',
         use_full_negative_list: bool = False,
         aux_vertex_weight: float = 0.0,
@@ -353,10 +354,16 @@ class CoupleReranker(nn.Module):
         input_dim: int | None = None,
     ):
         super().__init__()
-        if couple_loss not in ('pairwise', 'softmax-ce', 'lambda_ndcg2pp'):
+        if couple_loss not in (
+            'pairwise', 'softmax-ce', 'lambda_ndcg2pp', 'approx_ndcg',
+        ):
             raise ValueError(
-                f"couple_loss must be 'pairwise', 'softmax-ce' or "
-                f"'lambda_ndcg2pp', got '{couple_loss}'",
+                f"couple_loss must be 'pairwise', 'softmax-ce', "
+                f"'lambda_ndcg2pp', or 'approx_ndcg', got '{couple_loss}'",
+            )
+        if ndcg_alpha <= 0.0:
+            raise ValueError(
+                f'ndcg_alpha must be > 0, got {ndcg_alpha}',
             )
         if multi_positive not in ('none', 'uniform', 'soft_or'):
             raise ValueError(
@@ -408,6 +415,7 @@ class CoupleReranker(nn.Module):
         self.hardneg_margin = hardneg_margin
         self.ndcg_K = ndcg_K
         self.lambda_sigma = lambda_sigma
+        self.ndcg_alpha = ndcg_alpha
         self.multi_positive = multi_positive
         self.use_full_negative_list = use_full_negative_list
         self.aux_vertex_weight = aux_vertex_weight
@@ -670,6 +678,10 @@ class CoupleReranker(nn.Module):
             )
         elif self.couple_loss == 'lambda_ndcg2pp':
             ranking_loss = self._lambda_ndcg_loss(
+                scores, couple_labels, couple_mask,
+            )
+        elif self.couple_loss == 'approx_ndcg':
+            ranking_loss = self._approx_ndcg_loss(
                 scores, couple_labels, couple_mask,
             )
         else:
@@ -991,11 +1003,15 @@ class CoupleReranker(nn.Module):
             disc_diff = (pos_disc.unsqueeze(1) - neg_disc.unsqueeze(0)).abs()
             delta = gain_diff * disc_diff
 
-            # Top-K truncation: drop pair if BOTH ranks exceed K.
-            pos_in_K = pos_ranks.unsqueeze(1) <= ndcg_K
-            neg_in_K = neg_ranks.unsqueeze(0) <= ndcg_K
-            keep = pos_in_K | neg_in_K
-            delta = delta * keep.float()
+            # Top-K truncation: drop pair if BOTH ranks exceed K. When
+            # ndcg_K <= 0 the truncation is disabled and every (pos, neg)
+            # pair contributes — the NDCG log-discount already decays
+            # with rank so far-tail pairs have low weight organically.
+            if ndcg_K > 0:
+                pos_in_K = pos_ranks.unsqueeze(1) <= ndcg_K
+                neg_in_K = neg_ranks.unsqueeze(0) <= ndcg_K
+                keep = pos_in_K | neg_in_K
+                delta = delta * keep.float()
 
             # Pairwise ranknet-style term. `softplus(-σ·(s_pos-s_neg))`
             # is `log(1 + exp(−σ·(s_pos-s_neg)))`; numerically stable via
@@ -1003,10 +1019,110 @@ class CoupleReranker(nn.Module):
             score_margin = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)
             loss_mat = delta * functional.softplus(-sigma * score_margin)
 
-            # Normalise by number of pairs in this event so event loss
-            # magnitude does not scale with |pos|·|neg|.
+            # Ideal-DCG normalisation per Wang et al. 2018: divide by the
+            # DCG of the optimal ordering (all positives at the top).
+            # For binary gains with n_pos positives, ideal ordering is
+            # ranks 1..n_pos, so ideal_DCG = Σ_{r=1}^{n_pos} 1/log2(r+1).
+            n_pos = int(pos_indices.numel())
+            ideal_ranks = torch.arange(
+                1, n_pos + 1, device=event_scores.device,
+                dtype=event_scores.dtype,
+            )
+            ideal_dcg = (1.0 / torch.log2(ideal_ranks + 1.0)).sum()
+            # Normalise by ideal_DCG (NDCG-style) and by pair count so
+            # loss magnitude stays comparable across events with
+            # different |pos|·|neg|.
             num_pairs = max(1, delta.shape[0] * delta.shape[1])
-            event_losses.append(loss_mat.sum() / num_pairs)
+            event_losses.append(loss_mat.sum() / (ideal_dcg * num_pairs))
+
+        if not event_losses:
+            return scores.sum() * 0.0
+        return torch.stack(event_losses).mean()
+
+    def _approx_ndcg_loss(
+        self,
+        scores: torch.Tensor,
+        couple_labels: torch.Tensor,
+        couple_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """ApproxNDCG loss (Qin, Liu, Li 2010 — "A General Approximation
+        Framework for Direct Optimization of Information Retrieval
+        Measures").
+
+        Per event with binary relevance ``gain ∈ {0, 1}``:
+
+            approx_rank_i = 1 + Σ_{j ≠ i} sigmoid(α · (s_j − s_i))
+            DCG          = Σ_i gain_i / log₂(approx_rank_i + 1)
+            ideal_DCG    = Σ_{r=1}^{n_pos} 1 / log₂(r + 1)
+            NDCG         = DCG / ideal_DCG     ∈ [0, 1]
+            loss         = −NDCG               ∈ [−1, 0]
+
+        The sigmoid smooths the rank step function; as ``α → ∞`` the
+        approximation becomes exact (non-differentiable). ``α = 5`` is a
+        reasonable default for this problem scale.
+
+        Masked positions contribute no gain and are excluded from the
+        approximate rank sum (their score is pushed to −∞ before the
+        pairwise sigmoid so they always rank last).
+
+        Events with no positives or no valid couples contribute zero to
+        the final reduction.
+        """
+        batch_size = scores.shape[0]
+        alpha = self.ndcg_alpha
+        event_losses: list[torch.Tensor] = []
+
+        for event_index in range(batch_size):
+            event_scores = scores[event_index]
+            event_labels = couple_labels[event_index]
+            event_valid = couple_mask[event_index] > 0.5
+
+            positive_mask = (event_labels > 0.5) & event_valid
+            if not positive_mask.any() or not event_valid.any():
+                continue
+
+            # Mask out invalid positions by pushing their scores very low
+            # so they never rank above valid ones in the sigmoid sum.
+            # Use the dtype's min instead of the literal -1e6, which
+            # overflows fp16 under AMP autocast.
+            neg_fill = torch.finfo(event_scores.dtype).min
+            scores_masked = torch.where(
+                event_valid,
+                event_scores,
+                torch.full_like(event_scores, neg_fill),
+            )
+
+            # Pairwise sigmoid differences. rank_i = 1 + Σ_{j ≠ i}
+            # sigmoid(α·(s_j − s_i)) — "count of positions j beating i".
+            # With broadcasting `diff[i, j] = s[j] - s[i]`, the sum for
+            # position i runs over columns (dim=1). Invalid `i`
+            # positions end up with huge rank and zero gain, so they
+            # don't contribute to DCG.
+            diff = (
+                scores_masked.unsqueeze(0)
+                - scores_masked.unsqueeze(1)
+            )  # (C, C): [i, j] = s_j − s_i
+            sig = torch.sigmoid(alpha * diff)
+            # Zero self-pairs to exclude i==j from the sum.
+            diag_mask = 1.0 - torch.eye(
+                sig.shape[0], device=sig.device, dtype=sig.dtype,
+            )
+            approx_ranks = 1.0 + (sig * diag_mask).sum(dim=1)
+
+            gain = event_labels.float() * event_valid.float()
+            # DCG contributions: only GT positions matter because gain=0
+            # elsewhere. log2(rank + 1) is safe: approx_ranks >= 1.
+            dcg = (gain / torch.log2(approx_ranks + 1.0)).sum()
+
+            n_pos = int(positive_mask.sum().item())
+            ideal_ranks = torch.arange(
+                1, n_pos + 1, device=event_scores.device,
+                dtype=event_scores.dtype,
+            )
+            ideal_dcg = (1.0 / torch.log2(ideal_ranks + 1.0)).sum()
+
+            ndcg = dcg / ideal_dcg
+            event_losses.append(-ndcg)
 
         if not event_losses:
             return scores.sum() * 0.0

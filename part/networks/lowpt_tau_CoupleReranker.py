@@ -146,6 +146,7 @@ def get_model(data_config, **kwargs):
     tokenize_heads = kwargs.pop('tokenize_heads', 4)
     ndcg_K = kwargs.pop('ndcg_k', 100)
     lambda_sigma = kwargs.pop('lambda_sigma', 1.0)
+    ndcg_alpha = kwargs.pop('ndcg_alpha', 5.0)
     couple_multi_positive = kwargs.pop('couple_multi_positive', 'none')
     couple_use_full_negative_list = kwargs.pop(
         'couple_use_full_negative_list', False,
@@ -217,6 +218,7 @@ def get_model(data_config, **kwargs):
         hardneg_margin=couple_hardneg_margin,
         ndcg_K=ndcg_K,
         lambda_sigma=lambda_sigma,
+        ndcg_alpha=ndcg_alpha,
         multi_positive=couple_multi_positive,
         use_full_negative_list=couple_use_full_negative_list,
         aux_vertex_weight=aux_vertex_weight,
