@@ -67,6 +67,19 @@ class TrackPreFilter(nn.Module):
         listwise_temperature: float = 1.0,
         use_xgb_stub_feature: bool = False,
         clustering_dim: int = 8,
+        # -----------------------------------------------------------
+        # Expressiveness plug-in heads (prefilter P@256 sweep, 2026-04).
+        # All default to OFF; when disabled TrackPreFilter is identical
+        # to the E2a baseline (state-dict-compatible).
+        # -----------------------------------------------------------
+        feature_embed_mode: str = 'none',
+        feature_embed_dim: int = 32,
+        use_feature_gate: bool = False,
+        feature_gate_bottleneck: int = 16,
+        use_film_head: bool = False,
+        film_context_dim: int = 32,
+        use_soft_attention_aggregation: bool = False,
+        soft_attention_bottleneck: int = 64,
     ):
         super().__init__()
         self.mode = mode
@@ -176,10 +189,35 @@ class TrackPreFilter(nn.Module):
             # losing backward compat is acceptable.
             use_dropout = dropout > 0
 
+            # --- Optional expressiveness plug-in heads ---
+            # P1: per-feature embedding (grouped 1×1 conv over the 16
+            # raw features → 16*embed_dim channels). Swap the track_mlp
+            # first Conv1d's input width to match.
+            self.feature_embed_mode = feature_embed_mode
+            if feature_embed_mode == 'per_feature':
+                from weaver.nn.model.prefilter_expressiveness import (
+                    PerFeatureEmbedding,
+                )
+                self.feature_embedder = PerFeatureEmbedding(
+                    num_features=input_dim,
+                    embed_dim=feature_embed_dim,
+                )
+                track_mlp_input_dim = input_dim * feature_embed_dim
+            elif feature_embed_mode == 'none':
+                self.feature_embedder = None
+                track_mlp_input_dim = input_dim
+            else:
+                raise ValueError(
+                    f"feature_embed_mode must be 'none' or 'per_feature', "
+                    f"got {feature_embed_mode!r}",
+                )
+
             # --- Per-track MLP ---
             # Standard BN→ReLU→Dropout ordering for two Conv1d blocks.
             track_mlp_layers: list[nn.Module] = [
-                nn.Conv1d(input_dim, hidden_dim, kernel_size=1, bias=False),
+                nn.Conv1d(
+                    track_mlp_input_dim, hidden_dim, kernel_size=1, bias=False,
+                ),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
             ]
@@ -220,6 +258,49 @@ class TrackPreFilter(nn.Module):
             self.neighbor_mlps = nn.ModuleList([
                 _build_neighbor_mlp() for _ in range(num_message_rounds)
             ])
+
+            # --- Optional P2 (feature gate) + P3 (FiLM) heads ---
+            # Applied to the ``track_mlp`` output, before message
+            # passing. Both are disabled by default — when off, the
+            # forward path is bit-identical to the E2a baseline.
+            self.use_feature_gate = use_feature_gate
+            if use_feature_gate:
+                from weaver.nn.model.prefilter_expressiveness import FeatureGate
+                self.feature_gate = FeatureGate(
+                    hidden_dim=hidden_dim,
+                    bottleneck=feature_gate_bottleneck,
+                )
+            else:
+                self.feature_gate = None
+
+            self.use_film_head = use_film_head
+            if use_film_head:
+                from weaver.nn.model.prefilter_expressiveness import FiLMHead
+                self.film_head = FiLMHead(
+                    num_features=input_dim,
+                    hidden_dim=hidden_dim,
+                    context_dim=film_context_dim,
+                )
+            else:
+                self.film_head = None
+
+            # P4: soft-attention replaces max-pool in each message round.
+            # When off, the forward path keeps the E2a max-pool contract.
+            self.use_soft_attention_aggregation = use_soft_attention_aggregation
+            if use_soft_attention_aggregation:
+                from weaver.nn.model.prefilter_expressiveness import (
+                    SoftAttentionAggregator,
+                )
+                self.soft_attention_aggregators = nn.ModuleList([
+                    SoftAttentionAggregator(
+                        hidden_dim=hidden_dim,
+                        edge_dim=self.edge_feature_dim,
+                        bottleneck=soft_attention_bottleneck,
+                    )
+                    for _ in range(num_message_rounds)
+                ])
+            else:
+                self.soft_attention_aggregators = None
 
             # --- Scoring head ---
             # Dropout goes after the middle ReLU only. The final
@@ -508,13 +589,31 @@ class TrackPreFilter(nn.Module):
             )
 
         # Per-track embedding — route through xgb_stub augmented MLP when
-        # requested, else the canonical track_mlp.
+        # requested, else the canonical track_mlp. Optional P1 per-feature
+        # embedding sits between the raw features and track_mlp; P3 FiLM
+        # head modulates the track_mlp output with an event-level context;
+        # P2 feature gate is a Squeeze-Excite on the modulated output. All
+        # three default to off — when disabled, the forward path is
+        # bit-identical to the E2a baseline.
         if self.use_xgb_stub_feature:
             xgb_score = self.xgb_stub(features)  # (B, 1, P)
             augmented = torch.cat([features, xgb_score], dim=1)
             track_embedding = self.track_mlp_with_xgb(augmented) * mask_float
         else:
-            track_embedding = self.track_mlp(features) * mask_float  # (B, H, P)
+            if self.feature_embedder is not None:
+                features_for_mlp = self.feature_embedder(features)
+            else:
+                features_for_mlp = features
+            track_embedding = self.track_mlp(features_for_mlp) * mask_float
+
+        if self.film_head is not None:
+            track_embedding = self.film_head(
+                track_embedding, features, mask,
+            ) * mask_float
+        if self.feature_gate is not None:
+            track_embedding = self.feature_gate(
+                track_embedding, mask,
+            ) * mask_float
 
         # kNN indices in (eta, phi), computed once and reused across rounds
         with torch.no_grad():
@@ -528,12 +627,36 @@ class TrackPreFilter(nn.Module):
 
         # Edge features — computed once per forward since only dependent
         # on the kNN graph + Lorentz vectors, not on the evolving
-        # embedding. Max-pooled across K to produce a (B, 4, P) tensor.
+        # embedding. For max-pool: reduced to (B, 4, P). For
+        # soft-attention (P4): keep the per-neighbour (B, 4, P, K)
+        # tensor as an edge-feature input to the score MLP.
         if self.use_edge_features:
-            edge_max_pooled = self._compute_edge_max_pooled(
-                lorentz_vectors, mask_float, neighbor_indices,
-            )
+            if self.soft_attention_aggregators is not None:
+                # P4 path: keep the per-neighbour (B, 4, P, K) tensor
+                # as an input to the attention score MLP, and also
+                # max-pool it once so the downstream neighbor_mlp
+                # concat retains its E2a input shape.
+                edge_features_per_neighbor, edge_neighbor_validity = (
+                    self._compute_edge_features_per_neighbor(
+                        lorentz_vectors, mask_float, neighbor_indices,
+                    )
+                )
+                edge_for_max = edge_features_per_neighbor.masked_fill(
+                    edge_neighbor_validity == 0, float('-inf'),
+                )
+                edge_max_pooled = edge_for_max.max(dim=-1)[0]
+                edge_max_pooled = torch.where(
+                    torch.isfinite(edge_max_pooled),
+                    edge_max_pooled,
+                    torch.zeros_like(edge_max_pooled),
+                )
+            else:
+                edge_features_per_neighbor = None
+                edge_max_pooled = self._compute_edge_max_pooled(
+                    lorentz_vectors, mask_float, neighbor_indices,
+                )
         else:
+            edge_features_per_neighbor = None
             edge_max_pooled = None
 
         # Multi-round message passing
@@ -552,6 +675,18 @@ class TrackPreFilter(nn.Module):
                     neighbor_features, neighbor_validity,
                 )
                 aggregated = torch.cat([current, pna_aggregated], dim=1)
+            elif self.soft_attention_aggregators is not None:
+                # P4: learned soft-attention pooling replaces max-pool.
+                # Edge features flow as input to the score MLP (per-
+                # neighbour (B, 4, P, K) tensor); the attention-pooled
+                # output keeps shape (B, H, P), same as max-pool.
+                attention_pooled = self.soft_attention_aggregators[round_index](
+                    current,
+                    neighbor_features,
+                    neighbor_validity,
+                    edge_features_per_neighbor,
+                )
+                aggregated = torch.cat([current, attention_pooled], dim=1)
             else:
                 # Standard max-pool: cat([current, max_pooled]) → (B, 2*H, P)
                 neighbor_features = neighbor_features.masked_fill(
@@ -615,37 +750,57 @@ class TrackPreFilter(nn.Module):
         neighbors, the result is a (B, 4, P) tensor that can be
         appended to the round-level aggregation input.
         """
+        lv_features, neighbor_validity = self._compute_edge_features_per_neighbor(
+            lorentz_vectors, mask_float, neighbor_indices,
+        )
+        # Mask invalid neighbors with -inf so max-pool ignores them
+        lv_features_for_max = lv_features.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+        lv_max_pooled = lv_features_for_max.max(dim=-1)[0]
+        lv_max_pooled = lv_max_pooled.masked_fill(
+            lv_max_pooled == float('-inf'), 0.0,
+        )
+        return lv_max_pooled  # (B, 4, P)
+
+    def _compute_edge_features_per_neighbor(
+        self,
+        lorentz_vectors: torch.Tensor,
+        mask_float: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-neighbour pairwise Lorentz-vector features.
+
+        Returns ``(lv_features, neighbor_validity)`` both of shape
+        ``(B, 4, P, K)``. Used by both the max-pool path (further
+        reduced to ``(B, 4, P)``) and the soft-attention aggregator
+        (which consumes the per-neighbour tensor directly as an edge
+        input to its score MLP).
+        """
         from weaver.nn.model.ParticleTransformer import pairwise_lv_fts
 
-        # Gather neighbor 4-vectors: (B, 4, P, K)
+        # Gather neighbour 4-vectors + validity: (B, 4, P, K) and
+        # (B, 1, P, K) respectively.
         neighbor_lorentz_vectors = cross_set_gather(
             lorentz_vectors, neighbor_indices,
         )
         neighbor_validity = cross_set_gather(
             mask_float, neighbor_indices,
         )
-
         center_lorentz_expanded = lorentz_vectors.unsqueeze(-1).expand_as(
             neighbor_lorentz_vectors,
         )
         # Autocast off + detach + float32: same recipe as
-        # build_cross_set_edge_features in HierarchicalGraphBackbone.
+        # build_cross_set_edge_features in HierarchicalGraphBackbone
+        # to avoid sqrt(ΔR²) backward NaNs.
         with torch.amp.autocast('cuda', enabled=False):
             lv_features = pairwise_lv_fts(
                 center_lorentz_expanded.detach().float(),
                 neighbor_lorentz_vectors.detach().float(),
                 num_outputs=4,
-            )  # (B, 4, P, K), float32
+            )
         lv_features = lv_features.to(lorentz_vectors.dtype)
-        # Mask invalid neighbors with -inf so max-pool ignores them
-        lv_features = lv_features.masked_fill(
-            neighbor_validity == 0, float('-inf'),
-        )
-        lv_max_pooled = lv_features.max(dim=-1)[0]
-        lv_max_pooled = lv_max_pooled.masked_fill(
-            lv_max_pooled == float('-inf'), 0.0,
-        )
-        return lv_max_pooled  # (B, 4, P)
+        return lv_features, neighbor_validity
 
     def _forward_two_tower(
         self,

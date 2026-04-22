@@ -30,6 +30,14 @@ def get_model(data_config, **kwargs):
         'beta_loss_weight', 'clustering_dim',
         'per_track_loss_weight', 'refinement_loss_weight',
         'num_enrichment_layers',
+        # P6 two-tier-only kwargs: only consumed by
+        # networks/lowpt_tau_TwoTierPreFilter.py; silently dropped here
+        # so the single-tier path can be invoked from the same training
+        # CLI without argparse divergence.
+        'two_tier_top_n', 'two_tier_coarse_hidden_dim',
+        'two_tier_refine_hidden_dim', 'two_tier_coarse_neighbors',
+        'two_tier_refine_neighbors', 'two_tier_coarse_rounds',
+        'two_tier_refine_rounds', 'two_tier_composite_offset',
     ]:
         kwargs.pop(unused_arg, None)
 
@@ -50,6 +58,22 @@ def get_model(data_config, **kwargs):
         listwise_temperature=kwargs.pop('listwise_temperature', 1.0),
         use_xgb_stub_feature=kwargs.pop('use_xgb_stub_feature', False),
         clustering_dim=kwargs.pop('clustering_dim', 8),
+        # Expressiveness plug-ins (prefilter P@256 sweep). All default off;
+        # enabling any of them diverges the state-dict from the E2a baseline,
+        # so a checkpoint trained with these flags cannot be loaded into a
+        # stock E2a wrapper.
+        feature_embed_mode=kwargs.pop('feature_embed_mode', 'none'),
+        feature_embed_dim=kwargs.pop('feature_embed_dim', 32),
+        use_feature_gate=kwargs.pop('use_feature_gate', False),
+        feature_gate_bottleneck=kwargs.pop('feature_gate_bottleneck', 16),
+        use_film_head=kwargs.pop('use_film_head', False),
+        film_context_dim=kwargs.pop('film_context_dim', 32),
+        use_soft_attention_aggregation=kwargs.pop(
+            'use_soft_attention_aggregation', False,
+        ),
+        soft_attention_bottleneck=kwargs.pop(
+            'soft_attention_bottleneck', 64,
+        ),
         ranking_num_samples=50,
         # Dropout rate for the mlp-mode MLP hidden layers (track_mlp,
         # neighbor_mlps, scorer). 0.1 is the 2026-04-07 overfit-mitigation
