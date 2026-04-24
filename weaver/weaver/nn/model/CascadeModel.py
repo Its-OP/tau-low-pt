@@ -11,7 +11,7 @@ Stage 2 interface (any nn.Module implementing these methods):
 import torch
 import torch.nn as nn
 
-from weaver.nn.model.force_train_bn import force_train_bn
+from weaver.nn.model.stateless_bn import disable_bn_running_stats
 
 
 class CascadeModel(nn.Module):
@@ -34,17 +34,19 @@ class CascadeModel(nn.Module):
         self.stage2 = stage2
         self.top_k1 = top_k1
 
-        # Freeze Stage 1: no gradients, and pin its BatchNorm submodules
-        # to batch-statistics mode regardless of the cascade's train/eval
-        # state. Stage 1 running_mean/running_var are stale (the
-        # pre-filter training loop ran validation in .train() mode, see
-        # train_prefilter.py), and using them at inference drops R@600
-        # from 0.90 to 0.70. The `force_train_bn` patch keeps the rest of
-        # stage1 (Dropout, LayerNorm) obeying the cascade's outer mode
-        # while making the per-batch `.train()` dance unnecessary.
+        # Freeze Stage 1: no gradients, and disable BatchNorm running
+        # statistics so BN uses per-batch mean/var regardless of the
+        # cascade's train/eval state. Stage 1 running_mean/running_var
+        # are stale (the pre-filter training loop ran validation in
+        # .train() mode, see train_prefilter.py), and using them at
+        # inference drops R@600 from 0.90 to 0.70.
+        # `disable_bn_running_stats` flips each BN to
+        # `track_running_stats=False` and nulls its buffers, so eval
+        # mode falls through to batch-stat computation. Dropout and
+        # LayerNorm still obey the cascade's outer mode.
         for parameter in self.stage1.parameters():
             parameter.requires_grad = False
-        force_train_bn(self.stage1)
+        disable_bn_running_stats(self.stage1)
 
     @torch.no_grad()
     def _run_stage1(
@@ -60,10 +62,11 @@ class CascadeModel(nn.Module):
         Returns dict with filtered tensors (B, C, K1), stage1_scores (B, K1),
         and selected_indices (B, K1) mapping back to full-event positions.
         """
-        # Stage 1 BatchNorm stays on batch statistics via `force_train_bn`
-        # applied in __init__, so no per-call .train()/.eval() toggling is
-        # needed here. @torch.no_grad() handles gradient / param-update
-        # isolation.
+        # Stage 1 BatchNorm uses batch statistics unconditionally (its
+        # running-stat buffers were disabled in __init__ via
+        # `disable_bn_running_stats`), so no per-call .train()/.eval()
+        # toggling is needed here. @torch.no_grad() handles gradient /
+        # param-update isolation.
         scores = self.stage1(points, features, lorentz_vectors, mask)
         selected_indices = self.stage1.select_top_k(scores, mask, self.top_k1)
 

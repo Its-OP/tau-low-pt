@@ -280,10 +280,11 @@ def validate(
             points, features, lorentz_vectors, mask = model_inputs
 
             # Denoising is force-disabled via the compute_loss kwarg so
-            # val/train losses stay directly comparable. Stage 1 BN is
-            # already pinned to batch-statistics mode by CascadeModel via
-            # force_train_bn, so no per-batch train()/eval() toggling is
-            # needed to keep R@K stable.
+            # val/train losses stay directly comparable. Stage 1 BN has
+            # its running-stat buffers disabled by CascadeModel via
+            # disable_bn_running_stats, so forward always uses batch
+            # statistics regardless of train/eval state — no per-batch
+            # toggling is needed to keep R@K stable.
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
                 use_contrastive_denoising=False,
