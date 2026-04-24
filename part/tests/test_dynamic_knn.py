@@ -211,10 +211,21 @@ def test_padded_tracks_never_selected():
 
 
 def test_gradient_flows_to_coord_projection():
-    """loss.backward() populates non-zero grad on coord_projection weights."""
+    """After coord_to_hidden opens its gate, gradient reaches coord_projection.
+
+    coord_to_hidden is zero-initialized (B1 fix, 2026-04-24) so at step 0
+    coord_projection has no gradient path. This test mimics "one step of
+    training has happened" by perturbing coord_to_hidden weights, then
+    verifies the gradient path is wired correctly.
+    """
     model = TrackPreFilter(
         **_dynamic_kwargs(start_round=1, coord_dim=COORD_DIM),
     ).train()
+
+    # Open the gate: simulate a single optimizer step having occurred.
+    with torch.no_grad():
+        for param in model.coord_to_hidden.parameters():
+            param.copy_(torch.randn_like(param) * 0.01)
 
     points, features, lorentz_vectors, mask = _make_inputs()
     scores = model(points, features, lorentz_vectors, mask)
@@ -232,6 +243,32 @@ def test_gradient_flows_to_coord_projection():
         assert torch.isfinite(grad).all()
     total = sum(g.abs().sum() for g in coord_weight_grads)
     assert total > 0, 'gradient did not reach coord_projection'
+
+
+def test_coord_projection_grad_zero_at_init():
+    """At init (coord_to_hidden = 0), coord_projection receives no gradient.
+
+    Pins the B1 zero-init gate behavior — the residual is zero, so
+    coord_projection's downstream influence is zero, so its gradient is
+    zero. This is intentional; the gate opens once coord_to_hidden
+    picks up nonzero weights via training.
+    """
+    model = TrackPreFilter(
+        **_dynamic_kwargs(start_round=1, coord_dim=COORD_DIM),
+    ).train()
+
+    points, features, lorentz_vectors, mask = _make_inputs()
+    scores = model(points, features, lorentz_vectors, mask)
+    loss = scores[mask.squeeze(1).bool()].sum()
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if name.startswith('coord_projection') and param.ndim >= 2:
+            assert param.grad is not None
+            assert torch.all(param.grad == 0), (
+                f'{name} received non-zero grad at init '
+                f'(expected zero because coord_to_hidden is zero-init)'
+            )
 
 
 # ---- 7. Edge features refresh when indices change ----
@@ -257,6 +294,58 @@ def test_edge_features_refresh_when_enabled():
 
 
 # ---- 8. start_round controls which rounds are dynamic ----
+
+
+def test_coord_to_hidden_zero_init():
+    """coord_to_hidden weight is zero-initialized at model creation.
+
+    Guards the B1 fix (2026-04-24). Default Kaiming-init produced a
+    signal-sized noise residual that polluted message passing for ~5
+    epochs. Zero-init gates the residual open as training adds signal,
+    matching ResNet / LayerScale conventions.
+    """
+    model = TrackPreFilter(
+        **_dynamic_kwargs(start_round=1, coord_dim=COORD_DIM),
+    )
+    coord_to_hidden_weights = [
+        param for name, param in model.named_parameters()
+        if name.startswith('coord_to_hidden')
+    ]
+    assert coord_to_hidden_weights, 'coord_to_hidden weights not found'
+    for param in coord_to_hidden_weights:
+        assert torch.all(param == 0), (
+            f'coord_to_hidden parameter not zero-initialized; '
+            f'got non-zero values (max abs = {param.abs().max().item()})'
+        )
+
+
+def test_coord_stats_recorded():
+    """_record_dynamic_info=True captures pre-norm coord collapse stats.
+
+    Guards the B2 diagnostic. Tests that every dynamic round logs a
+    pre_norm_mean + pre_channel_std scalar so a training probe can
+    detect BN running-stat collapse (empirically the failure mode of
+    attaching a fresh BN to a masked tensor).
+    """
+    model = TrackPreFilter(
+        **_dynamic_kwargs(start_round=1, coord_dim=COORD_DIM),
+    ).eval()
+    model._record_dynamic_info = True
+
+    points, features, lorentz_vectors, mask = _make_inputs()
+    with torch.no_grad():
+        _ = model(points, features, lorentz_vectors, mask)
+
+    info = model._last_dynamic_info
+    stats = info.get('coord_stats_per_round')
+    assert stats is not None, 'coord_stats_per_round missing'
+    active_rounds = info['dynamic_rounds_active']
+    assert set(stats.keys()) == set(active_rounds)
+    for round_index, round_stats in stats.items():
+        assert 'pre_norm_mean' in round_stats
+        assert 'pre_channel_std' in round_stats
+        assert torch.isfinite(round_stats['pre_norm_mean'])
+        assert torch.isfinite(round_stats['pre_channel_std'])
 
 
 def test_start_round_controls_active_rounds():

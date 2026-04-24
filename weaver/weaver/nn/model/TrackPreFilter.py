@@ -141,6 +141,7 @@ class TrackPreFilter(nn.Module):
         # to keep the production forward allocation-free.
         self._record_dynamic_info: bool = False
         self._last_dynamic_info: dict | None = None
+        self._latest_coord_stats: dict | None = None
 
         # Pairwise LV edge features on k-NN edges (ParT-style).
         # When True, each message round appends max-pooled pairwise_lv_fts
@@ -359,6 +360,18 @@ class TrackPreFilter(nn.Module):
                     kernel_size=1,
                     bias=False,
                 )
+                # Zero-init the residual projection. Empirical (2026-04-24
+                # D1 run, commit 22dd455): default Kaiming-uniform on W
+                # produces a residual of magnitude ~√(d_coord) × σ(W) ≈
+                # √2 at init on unit-normalized coords. That is signal-
+                # sized noise added to ``current`` (~1 after BN), which
+                # pollutes every message-passing round until coord
+                # projection trains the noise out. D1-v1 P@256 trailed
+                # the P1 baseline by ~3.5 pp at ep 5 and the gap widened.
+                # Zero-init gives the residual a gate-open-slowly schedule
+                # (same pattern as ResNet zero-init, LayerScale); at init
+                # D1 = P1 + static kNN, so early-epoch trajectory matches.
+                nn.init.zeros_(self.coord_to_hidden.weight)
             else:
                 self.coord_projection = None
                 self.coord_to_hidden = None
@@ -698,12 +711,13 @@ class TrackPreFilter(nn.Module):
         # Dynamic-kNN diagnostic collection (tests + training probes).
         # Disabled by default — flipping ``self._record_dynamic_info``
         # to True before a forward pass populates ``_last_dynamic_info``
-        # with per-round indices / coords / edges.
+        # with per-round indices / coords / edges / collapse stats.
         record = self._record_dynamic_info
         diag_neighbor_indices: list = []
         diag_edge_max: list = []
         diag_coords: dict = {}
         diag_active_rounds: list = []
+        diag_coord_stats: dict = {}
 
         # Pre-round-0 rebuild: if start_round <= 0, the first round
         # should use learned coords, not (eta, phi). We project the
@@ -737,6 +751,8 @@ class TrackPreFilter(nn.Module):
             if record:
                 diag_coords[0] = coords.detach()
                 diag_active_rounds.append(0)
+                if self._latest_coord_stats is not None:
+                    diag_coord_stats[0] = self._latest_coord_stats
 
         # Multi-round message passing
         current = track_embedding
@@ -825,6 +841,8 @@ class TrackPreFilter(nn.Module):
                 if record:
                     diag_coords[next_round] = coords.detach()
                     diag_active_rounds.append(next_round)
+                    if self._latest_coord_stats is not None:
+                        diag_coord_stats[next_round] = self._latest_coord_stats
 
         if record:
             self._last_dynamic_info = {
@@ -832,6 +850,7 @@ class TrackPreFilter(nn.Module):
                 'coords_per_round': diag_coords,
                 'edge_max_pooled_per_round': diag_edge_max or None,
                 'dynamic_rounds_active': diag_active_rounds,
+                'coord_stats_per_round': diag_coord_stats or None,
             }
 
         # Cache the final per-track embedding for downstream loss heads
@@ -941,9 +960,25 @@ class TrackPreFilter(nn.Module):
         )
 
         with torch.amp.autocast('cuda', enabled=False):
-            coords = self.coord_projection(embedding.float())
-            coord_norm = coords.norm(dim=1, keepdim=True)
-            coords = coords / (coord_norm + 1e-6)
+            coords_raw = self.coord_projection(embedding.float())
+            coord_norm = coords_raw.norm(dim=1, keepdim=True)
+            coords = coords_raw / (coord_norm + 1e-6)
+
+        # B2 collapse diagnostic: pre-normalization std (across channels
+        # per track, averaged over batch × valid-track positions) and
+        # mean raw norm. If either collapses toward 0, the kNN topology
+        # becomes degenerate (distances ≈ 0 for all pairs). Stored on
+        # the module so the caller can fold it into _last_dynamic_info.
+        if self._record_dynamic_info:
+            valid_mask = mask.bool()
+            self._latest_coord_stats = {
+                'pre_norm_mean': coord_norm.masked_select(valid_mask).mean().detach(),
+                'pre_channel_std': coords_raw.std(dim=1, keepdim=True).masked_select(
+                    valid_mask,
+                ).mean().detach(),
+            }
+        else:
+            self._latest_coord_stats = None
 
         with torch.no_grad():
             neighbor_indices = euclidean_cross_set_knn(
