@@ -481,17 +481,14 @@ def validate(
             # Denoising force-disabled in the validation path so the val
             # loss stays directly comparable to train's ranking component
             # (denoising is a train-only regularizer, not a metric).
-            # model.train() is required for BN batch-stats — the running
-            # stats stored in the checkpoint are stale (see reports/
-            # experiment_log.md "BatchNorm Fix"). Dropout also activates
-            # here in train() mode, but the BN workaround is more load-
-            # bearing than dropout determinism during a single val pass.
-            model.train()
+            # BatchNorm uses batch statistics unconditionally thanks to
+            # track_running_stats=False at each BN construction site (see
+            # TrackPreFilter.py), so no .train()/.eval() toggling is
+            # needed here — Dropout stays off for a clean val pass.
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
                 use_contrastive_denoising=False,
             )
-            model.eval()
 
             per_track_scores = loss_dict.pop('_scores').detach()
 
