@@ -79,7 +79,23 @@ METRIC_LABELS: dict[str, str] = {
     'd_prime': "Cohen's d' between GT and background score distributions (val)",
     'median_gt_rank': 'Median rank of GT pions in the per-event score order (val)',
 }
-for _k in (10, 20, 30, 50, 100, 200, 300, 400, 500, 600, 800):
+# K values reported by the val MetricsAccumulator at each epoch. 256 is
+# the operating-point K of the cascade (Stage 1 → Stage 2 top-K1), so
+# per-event ``perfect_at_256`` is a first-class checkpoint-selection
+# criterion alongside the legacy ``recall_at_200``.
+VAL_METRICS_K_VALUES: tuple[int, ...] = (
+    10, 20, 30, 50, 100, 200, 256, 300, 400, 500, 600, 800,
+)
+# Criteria that ``--checkpoint-criterion`` accepts. Keep synced with
+# VAL_METRICS_K_VALUES — any ``perfect_at_N`` or ``recall_at_N`` with
+# ``N`` in the tuple is computed and thus selectable.
+CHECKPOINT_CRITERIA: tuple[str, ...] = (
+    'recall_at_200',
+    'recall_at_256',
+    'perfect_at_200',
+    'perfect_at_256',
+)
+for _k in VAL_METRICS_K_VALUES:
     METRIC_LABELS[f'recall_at_{_k}'] = (
         f'R@{_k}: per-event recall at top-{_k} tracks '
         f'(fraction of GT pions in the model top-{_k}, val-averaged)'
@@ -444,7 +460,7 @@ def validate(
     num_batches = 0
 
     metrics_accumulator = MetricsAccumulator(
-        k_values=(10, 20, 30, 50, 100, 200, 300, 400, 500, 600, 800),
+        k_values=VAL_METRICS_K_VALUES,
     )
 
     with torch.no_grad():
@@ -644,6 +660,78 @@ def _build_argument_parser() -> argparse.ArgumentParser:
              'with the pre-computed scores. The flag exists so the '
              'input-dim path is exercised.',
     )
+    # --- Expressiveness plug-in heads (prefilter P@256 sweep) ---
+    parser.add_argument(
+        '--feature-embed-mode', type=str, default='per_feature',
+        choices=('none', 'per_feature'),
+        help='P1 (now baseline). "per_feature" routes each raw input '
+             'channel through its own grouped 1×1 Conv + LayerNorm + '
+             'ReLU before track_mlp, producing (16 * feature_embed_dim) '
+             'channels. Pass "none" to reproduce the pre-P1 E2a anchor.',
+    )
+    parser.add_argument(
+        '--feature-embed-dim', type=int, default=32,
+        help='P1 per-feature embedding width (only used when '
+             '--feature-embed-mode=per_feature).',
+    )
+    parser.add_argument(
+        '--feature-gate', action='store_true',
+        help='P2. Apply an SE-style squeeze-excite gate to the track_mlp '
+             'output (per-event, per-channel).',
+    )
+    parser.add_argument(
+        '--feature-gate-bottleneck', type=int, default=16,
+        help='P2 SE bottleneck width (only used with --feature-gate).',
+    )
+    parser.add_argument(
+        '--film-head', action='store_true',
+        help='P3. Modulate the track_mlp output with FiLM (γ, β) derived '
+             'from event-level (mean, std) of the standardised features.',
+    )
+    parser.add_argument(
+        '--film-context-dim', type=int, default=32,
+        help='P3 FiLM context hidden width.',
+    )
+    parser.add_argument(
+        '--soft-attention-aggregation', action='store_true',
+        help='P4. Replace max-pool in each message-passing round with a '
+             'learned soft-attention aggregator over the k-NN '
+             'neighbours. Edge features flow into the attention score.',
+    )
+    parser.add_argument(
+        '--soft-attention-bottleneck', type=int, default=64,
+        help='P4 score-MLP bottleneck width.',
+    )
+    # --- Two-tier prefilter (P6) — only read by
+    #     networks/lowpt_tau_TwoTierPreFilter.py wrapper.
+    parser.add_argument(
+        '--two-tier-top-n', type=int, default=600,
+        help='P6 top-N cut between coarse and refine tiers.',
+    )
+    parser.add_argument(
+        '--two-tier-coarse-hidden-dim', type=int, default=128,
+        help='P6 coarse tier hidden dim.',
+    )
+    parser.add_argument(
+        '--two-tier-refine-hidden-dim', type=int, default=384,
+        help='P6 refine tier hidden dim.',
+    )
+    parser.add_argument(
+        '--two-tier-coarse-neighbors', type=int, default=16,
+        help='P6 coarse tier kNN k.',
+    )
+    parser.add_argument(
+        '--two-tier-refine-neighbors', type=int, default=32,
+        help='P6 refine tier kNN k (must be < --two-tier-top-n).',
+    )
+    parser.add_argument(
+        '--two-tier-coarse-rounds', type=int, default=2,
+        help='P6 coarse tier message-passing rounds.',
+    )
+    parser.add_argument(
+        '--two-tier-refine-rounds', type=int, default=3,
+        help='P6 refine tier message-passing rounds.',
+    )
     parser.add_argument('--train-fraction', type=float, default=0.8,
                         help='Fraction of data-dir for training (ignored if --val-data-dir set)')
     parser.add_argument('--val-data-dir', type=str, default=None,
@@ -662,6 +750,17 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--optimizer', type=str, default='adamw', choices=OPTIMIZER_NAMES,
         help='Optimizer to use. SOAP and Muon require --amp disabled.',
+    )
+    parser.add_argument(
+        '--checkpoint-criterion', type=str,
+        default='recall_at_200', choices=CHECKPOINT_CRITERIA,
+        help=(
+            'Validation metric used to pick the best checkpoint. '
+            '"recall_at_200" preserves the 17-experiment campaign convention; '
+            '"perfect_at_256" tracks the per-event perfect-recall target '
+            'directly (the prefilter-expressiveness sweep primary metric). '
+            f'Choices: {", ".join(CHECKPOINT_CRITERIA)}.'
+        ),
     )
     parser.add_argument(
         '--profile-steps', type=int, default=0,
@@ -837,6 +936,24 @@ def main():
         listwise_temperature=args.listwise_temperature,
         use_xgb_stub_feature=args.use_xgb_stub_feature,
         clustering_dim=args.clustering_dim,
+        feature_embed_mode=args.feature_embed_mode,
+        feature_embed_dim=args.feature_embed_dim,
+        use_feature_gate=args.feature_gate,
+        feature_gate_bottleneck=args.feature_gate_bottleneck,
+        use_film_head=args.film_head,
+        film_context_dim=args.film_context_dim,
+        use_soft_attention_aggregation=args.soft_attention_aggregation,
+        soft_attention_bottleneck=args.soft_attention_bottleneck,
+        # Two-tier-only kwargs — ignored by the single-tier wrapper
+        # (see `networks/lowpt_tau_TrackPreFilter.py`) and consumed by
+        # `networks/lowpt_tau_TwoTierPreFilter.py`.
+        two_tier_top_n=args.two_tier_top_n,
+        two_tier_coarse_hidden_dim=args.two_tier_coarse_hidden_dim,
+        two_tier_refine_hidden_dim=args.two_tier_refine_hidden_dim,
+        two_tier_coarse_neighbors=args.two_tier_coarse_neighbors,
+        two_tier_refine_neighbors=args.two_tier_refine_neighbors,
+        two_tier_coarse_rounds=args.two_tier_coarse_rounds,
+        two_tier_refine_rounds=args.two_tier_refine_rounds,
     )
     # Post-construction scalar attribute tweaks for the OC / MPM flags
     # that don't change module layout.
@@ -970,17 +1087,17 @@ def main():
     # ---- Training loop ----
     start_epoch = 1
     best_val_loss = float('inf')
-    best_val_recall_at_200 = 0.0
+    best_val_score = 0.0
+    checkpoint_criterion = args.checkpoint_criterion
     best_val_epoch = 0
     global_batch_count = 0
-    loss_history = {
+    loss_history: dict[str, list] = {
         'train': [], 'val': [], 'lr': [],
-        'recall_at_10': [], 'recall_at_20': [], 'recall_at_30': [],
-        'recall_at_50': [], 'recall_at_100': [], 'recall_at_200': [],
-        'recall_at_300': [], 'recall_at_400': [], 'recall_at_500': [],
-        'recall_at_600': [], 'recall_at_800': [],
         'd_prime': [], 'median_gt_rank': [],
     }
+    for _k in VAL_METRICS_K_VALUES:
+        loss_history[f'recall_at_{_k}'] = []
+    del _k
 
     if args.resume is not None:
         logger.info(f'Resuming from checkpoint: {args.resume}')
@@ -1002,14 +1119,21 @@ def main():
             )
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        best_val_recall_at_200 = checkpoint.get(
-            'best_val_recall_at_200', 0.0,
-        )
+        # Backward-compatible resume: older checkpoints only stored
+        # ``best_val_recall_at_200``. If the new ``best_val_score`` key is
+        # absent and the criterion matches the legacy one, inherit from it.
+        if 'best_val_score' in checkpoint:
+            best_val_score = checkpoint['best_val_score']
+        elif checkpoint_criterion == 'recall_at_200':
+            best_val_score = checkpoint.get('best_val_recall_at_200', 0.0)
+        else:
+            best_val_score = 0.0
         best_val_epoch = checkpoint.get('best_val_epoch', 0)
         global_batch_count = checkpoint.get('global_batch_count', 0)
         logger.info(
             f'Resumed from epoch {start_epoch - 1}, '
-            f'best_val_loss={best_val_loss:.5f}',
+            f'best_val_loss={best_val_loss:.5f}, '
+            f'best {checkpoint_criterion}={best_val_score:.5f}',
         )
 
     # Profile-only entry: run N batches under torch.profiler, then exit.
@@ -1088,20 +1212,22 @@ def main():
             )
 
             val_loss = val_losses['total_loss']
-            val_recall_at_200 = val_metrics.get('recall_at_200', 0.0)
+            val_score = val_metrics.get(checkpoint_criterion, 0.0)
 
-            # Best model is selected by R@200 (higher is better),
-            # not val loss — DRW and other techniques intentionally
-            # increase loss while improving task metrics.
-            is_best = val_recall_at_200 > best_val_recall_at_200
+            # Best model is selected by the checkpoint-criterion metric
+            # (higher is better), not val loss — DRW and other techniques
+            # intentionally increase loss while improving task metrics.
+            is_best = val_score > best_val_score
             if is_best:
-                best_val_recall_at_200 = val_recall_at_200
+                best_val_score = val_score
                 best_val_epoch = epoch
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
 
             def _format_metrics(metrics):
                 perfect_200 = metrics.get('perfect_at_200', 0.0)
+                perfect_256 = metrics.get('perfect_at_256', 0.0)
+                recall_256 = metrics.get('recall_at_256', 0.0)
                 recall_500 = metrics.get('recall_at_500', 0.0)
                 recall_600 = metrics.get('recall_at_600', 0.0)
                 rank_p90 = metrics.get('gt_rank_p90', 0.0)
@@ -1109,9 +1235,11 @@ def main():
                     f'R@30: {metrics["recall_at_30"]:.4f} | '
                     f'R@100: {metrics["recall_at_100"]:.4f} | '
                     f'R@200: {metrics["recall_at_200"]:.4f} | '
+                    f'R@256: {recall_256:.4f} | '
                     f'R@500: {recall_500:.4f} | '
                     f'R@600: {recall_600:.4f} | '
                     f'P@200: {perfect_200:.4f} | '
+                    f'P@256: {perfect_256:.4f} | '
                     f'd\': {metrics["d_prime"]:.3f} | '
                     f'rank: {metrics["median_gt_rank"]:.0f} '
                     f'(p90={rank_p90:.0f})'
@@ -1129,7 +1257,7 @@ def main():
                 logger.info(
                     f'Epoch {epoch} val | '
                     f'total: {val_loss:.5f} '
-                    f'R@200: {val_recall_at_200:.4f} ★ new best | '
+                    f'{checkpoint_criterion}: {val_score:.4f} ★ new best | '
                     f'{val_summary}',
                 )
             else:
@@ -1137,7 +1265,7 @@ def main():
                 logger.info(
                     f'Epoch {epoch} val | '
                     f'total: {val_loss:.5f} '
-                    f'(best R@200: {best_val_recall_at_200:.4f}, '
+                    f'(best {checkpoint_criterion}: {best_val_score:.4f}, '
                     f'{epochs_since_best} epochs ago) | '
                     f'{val_summary}',
                 )
@@ -1213,7 +1341,8 @@ def main():
                     'model_state_dict': original_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'best_val_loss': best_val_loss,
-                    'best_val_recall_at_200': best_val_recall_at_200,
+                    'best_val_score': best_val_score,
+                    'checkpoint_criterion': checkpoint_criterion,
                     'best_val_epoch': best_val_epoch,
                     'global_batch_count': global_batch_count,
                     'val_losses': val_losses,
@@ -1221,7 +1350,7 @@ def main():
                     'args': vars(args),
                 }
                 checkpoint_manager.save_checkpoint(
-                    checkpoint, epoch, val_recall_at_200, is_best,
+                    checkpoint, epoch, val_score, is_best,
                 )
 
     except Exception:

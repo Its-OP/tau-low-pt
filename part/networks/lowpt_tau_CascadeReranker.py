@@ -16,6 +16,88 @@ from weaver.nn.model.TrackPreFilter import TrackPreFilter
 from weaver.utils.logger import _logger
 
 
+def infer_stage1_kwargs(stage1_state, stage1_num_neighbors=16):
+    """Recover TrackPreFilter constructor kwargs from a state_dict.
+
+    Handles checkpoints from any point in the prefilter lineage:
+    hidden_dim, num_message_rounds, use_edge_features, dropout, and
+    the P1 per-feature embedding (feature_embed_mode, feature_embed_dim)
+    are all inferred from module-key shapes. num_neighbors is NOT
+    recoverable from state dict (runtime-only kNN k); pass it in.
+    """
+    first_layer_key = 'track_mlp.0.weight'
+    if first_layer_key not in stage1_state:
+        raise ValueError(
+            f'Cannot infer Stage 1 dimensions: expected key '
+            f'"{first_layer_key}" not found in state dict',
+        )
+    first_layer_weight = stage1_state[first_layer_key]
+    inferred_hidden_dim = first_layer_weight.shape[0]
+
+    # P1 per-feature embedding inflates track_mlp input from F to F*E.
+    # Detect presence by module-key prefix; recover E from the LayerNorm
+    # weight shape (feature_embedder.layer_norm.weight has shape (E,)).
+    has_feature_embedder = any(
+        key.startswith('feature_embedder.') for key in stage1_state
+    )
+    if has_feature_embedder:
+        feature_embed_mode = 'per_feature'
+        feature_embed_dim = stage1_state[
+            'feature_embedder.layer_norm.weight'
+        ].shape[0]
+        inferred_input_dim = first_layer_weight.shape[1] // feature_embed_dim
+    else:
+        feature_embed_mode = 'none'
+        feature_embed_dim = 32
+        inferred_input_dim = first_layer_weight.shape[1]
+
+    stage1_round_indices = {
+        int(key.split('.')[1]) for key in stage1_state
+        if key.startswith('neighbor_mlps.')
+    }
+    inferred_num_message_rounds = (
+        max(stage1_round_indices) + 1 if stage1_round_indices else 0
+    )
+    first_neighbor_weight = stage1_state.get('neighbor_mlps.0.0.weight')
+    if first_neighbor_weight is not None:
+        neighbor_in_dim = first_neighbor_weight.shape[1]
+        expected_no_edges = 2 * inferred_hidden_dim
+        if neighbor_in_dim == expected_no_edges:
+            inferred_use_edge = False
+        elif neighbor_in_dim == expected_no_edges + 4:
+            inferred_use_edge = True
+        else:
+            raise ValueError(
+                f'Cannot infer use_edge_features: neighbor_mlps.0.0 '
+                f'in_dim={neighbor_in_dim}, expected '
+                f'{expected_no_edges} (no edges) or '
+                f'{expected_no_edges + 4} (edges)',
+            )
+    else:
+        inferred_use_edge = False
+
+    # Dropout>0 shifts the track_mlp Sequential indices by 1: with
+    # dropout, track_mlp.4.weight is a Conv1d (shape [C, C, 1]); without,
+    # it is a BatchNorm weight (shape [C]).
+    second_conv_weight = stage1_state.get('track_mlp.4.weight')
+    if second_conv_weight is not None and second_conv_weight.dim() == 3:
+        inferred_dropout = 0.1
+    else:
+        inferred_dropout = 0.0
+
+    return dict(
+        mode='mlp',
+        input_dim=inferred_input_dim,
+        hidden_dim=inferred_hidden_dim,
+        num_message_rounds=inferred_num_message_rounds,
+        num_neighbors=stage1_num_neighbors,
+        use_edge_features=inferred_use_edge,
+        dropout=inferred_dropout,
+        feature_embed_mode=feature_embed_mode,
+        feature_embed_dim=feature_embed_dim,
+    )
+
+
 def get_model(data_config, **kwargs):
     """Build CascadeModel with frozen Stage 1 + CascadeReranker Stage 2.
 
@@ -75,89 +157,19 @@ def get_model(data_config, **kwargs):
 
     _logger.info(f'Loading Stage 1 from: {stage1_checkpoint}')
     checkpoint = torch.load(stage1_checkpoint, map_location='cpu', weights_only=False)
-
-    # Infer Stage 1 hidden_dim and input_dim from state dict shapes so the
-    # wrapper adapts to checkpoints trained with different widths (e.g., the
-    # 2026-04 cutoff run uses hidden_dim=256 while earlier runs used 192).
-    # track_mlp.0.weight has shape (hidden_dim, input_dim, 1) in the MLP backbone.
     stage1_state = checkpoint.get('model_state_dict', checkpoint)
-    first_layer_key = 'track_mlp.0.weight'
-    if first_layer_key not in stage1_state:
-        raise ValueError(
-            f'Cannot infer Stage 1 dimensions: expected key '
-            f'"{first_layer_key}" not found in {stage1_checkpoint}'
-        )
-    inferred_hidden_dim = stage1_state[first_layer_key].shape[0]
-    inferred_input_dim = stage1_state[first_layer_key].shape[1]
-    if inferred_input_dim != input_dim:
-        raise ValueError(
-            f'Stage 1 checkpoint input_dim={inferred_input_dim} does not '
-            f'match data config input_dim={input_dim}. '
-            f'Retrain Stage 1 on the current feature set.'
-        )
 
-    # Infer num_message_rounds by counting neighbor_mlps.N.*
-    # Infer use_edge_features from neighbor_mlps.0.0.weight shape[1]:
-    # without edges: 2 * hidden_dim. With edges: 2 * hidden_dim + 4.
-    stage1_round_indices = {
-        int(k.split('.')[1]) for k in stage1_state
-        if k.startswith('neighbor_mlps.')
-    }
-    inferred_num_message_rounds = (
-        max(stage1_round_indices) + 1 if stage1_round_indices else 0
-    )
-    first_neighbor_weight = stage1_state.get('neighbor_mlps.0.0.weight')
-    if first_neighbor_weight is not None:
-        neighbor_in_dim = first_neighbor_weight.shape[1]
-        expected_no_edges = 2 * inferred_hidden_dim
-        if neighbor_in_dim == expected_no_edges:
-            inferred_use_edge = False
-        elif neighbor_in_dim == expected_no_edges + 4:
-            inferred_use_edge = True
-        else:
-            raise ValueError(
-                f'Cannot infer use_edge_features: neighbor_mlps.0.0 '
-                f'in_dim={neighbor_in_dim}, expected '
-                f'{expected_no_edges} (no edges) or '
-                f'{expected_no_edges + 4} (edges)',
-            )
-    else:
-        inferred_use_edge = False
-
-    # num_neighbors is NOT recoverable from state dict (runtime-only kNN k).
-    # Default to 16 for legacy checkpoints. Callers that trained with a
-    # different k must override via kwargs['stage1_num_neighbors'].
     stage1_num_neighbors = kwargs.pop('stage1_num_neighbors', 16)
+    stage1_kwargs = infer_stage1_kwargs(stage1_state, stage1_num_neighbors)
+    if stage1_kwargs['input_dim'] != input_dim:
+        raise ValueError(
+            f'Stage 1 checkpoint input_dim={stage1_kwargs["input_dim"]} '
+            f'does not match data config input_dim={input_dim}. '
+            f'Retrain Stage 1 on the current feature set.',
+        )
+    _logger.info(f'Stage 1 config from checkpoint: {stage1_kwargs}')
 
-    # Dropout>0 inserts nn.Dropout into the Sequential, shifting conv indices.
-    # Zero-dropout key pattern: track_mlp.3.weight is Conv1d (shape [C, C, 1]),
-    # track_mlp.4.weight is BatchNorm (shape [C]).
-    # Dropout>0 pattern: track_mlp.4.weight is Conv1d ([C, C, 1]) because the
-    # dropout module shifts indices by 1.
-    second_conv_weight = stage1_state.get('track_mlp.4.weight')
-    if second_conv_weight is not None and second_conv_weight.dim() == 3:
-        inferred_dropout = 0.1  # any >0 reproduces the layer layout
-    else:
-        inferred_dropout = 0.0
-
-    _logger.info(
-        f'Stage 1 config from checkpoint: hidden_dim={inferred_hidden_dim}, '
-        f'input_dim={inferred_input_dim}, '
-        f'num_message_rounds={inferred_num_message_rounds}, '
-        f'use_edge_features={inferred_use_edge}, '
-        f'num_neighbors={stage1_num_neighbors}, '
-        f'dropout={inferred_dropout}',
-    )
-
-    stage1 = TrackPreFilter(
-        mode='mlp',
-        input_dim=inferred_input_dim,
-        hidden_dim=inferred_hidden_dim,
-        num_message_rounds=inferred_num_message_rounds,
-        num_neighbors=stage1_num_neighbors,
-        use_edge_features=inferred_use_edge,
-        dropout=inferred_dropout,
-    )
+    stage1 = TrackPreFilter(**stage1_kwargs)
     stage1.load_state_dict(stage1_state)
     _logger.info('Stage 1 loaded successfully')
 
