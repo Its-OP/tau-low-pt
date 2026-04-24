@@ -79,6 +79,14 @@ def get_model(data_config, **kwargs):
         soft_attention_bottleneck=kwargs.pop(
             'soft_attention_bottleneck', 64,
         ),
+        # Dynamic kNN (DGCNN/ParticleNet-style). OFF by default —
+        # state-dict parity with the current P1 baseline checkpoint.
+        dynamic_knn=kwargs.pop('dynamic_knn', False),
+        dynamic_knn_start_round=kwargs.pop('dynamic_knn_start_round', 1),
+        dynamic_knn_coord_dim=kwargs.pop('dynamic_knn_coord_dim', 8),
+        dynamic_knn_refresh_edge=kwargs.pop(
+            'dynamic_knn_refresh_edge', True,
+        ),
         ranking_num_samples=50,
         # Dropout rate for the mlp-mode MLP hidden layers (track_mlp,
         # neighbor_mlps, scorer). 0.1 is the 2026-04-07 overfit-mitigation

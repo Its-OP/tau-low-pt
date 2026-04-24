@@ -122,6 +122,9 @@ declare -A NETWORK_FAMILY=(
     [P3]="single"
     [P4]="single"
     [P6]="two_tier"
+    [D1]="single"
+    [D2]="single"
+    [D3]="single"
 )
 declare -A EXPERIMENT_ARGS=(
     # Baseline = train_prefilter.py + wrapper defaults: edges ON, k=16,
@@ -138,6 +141,13 @@ declare -A EXPERIMENT_ARGS=(
     [P3]="--film-head --film-context-dim 32"
     [P4]="--soft-attention-aggregation --soft-attention-bottleneck 64"
     [P6]="--two-tier-top-n 600 --two-tier-coarse-hidden-dim 128 --two-tier-refine-hidden-dim 384 --two-tier-coarse-neighbors 16 --two-tier-refine-neighbors 32 --two-tier-coarse-rounds 2 --two-tier-refine-rounds 3"
+    # D* = DGCNN/ParticleNet-style dynamic kNN rebuild. D1 = default
+    # recipe (warm-start round 0 on spatial kNN, rounds 1-2 use learned
+    # coords, d_coord=8). D2 = fully dynamic from round 0. D3 = richer
+    # coord space (d=16).
+    [D1]="--dynamic-knn --dynamic-knn-start-round 1 --dynamic-knn-coord-dim 8"
+    [D2]="--dynamic-knn --dynamic-knn-start-round 0 --dynamic-knn-coord-dim 8"
+    [D3]="--dynamic-knn --dynamic-knn-start-round 1 --dynamic-knn-coord-dim 16"
 )
 
 # Scheduling order — cheapest / lowest-risk first.
@@ -148,6 +158,9 @@ EXPERIMENT_ORDER=(
     P1
     P4
     P6
+    D1
+    D2
+    D3
 )
 
 # If user specified experiments, filter the order.

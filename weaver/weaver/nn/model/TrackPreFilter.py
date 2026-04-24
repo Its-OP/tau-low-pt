@@ -80,6 +80,16 @@ class TrackPreFilter(nn.Module):
         film_context_dim: int = 32,
         use_soft_attention_aggregation: bool = False,
         soft_attention_bottleneck: int = 64,
+        # -----------------------------------------------------------
+        # DGCNN/ParticleNet-style dynamic kNN (2026-04). When ON, the
+        # neighbor graph is rebuilt in a learned low-dim coordinate
+        # space between message-passing rounds. OFF → bit-identical to
+        # the P1 baseline, state-dict-compatible.
+        # -----------------------------------------------------------
+        dynamic_knn: bool = False,
+        dynamic_knn_start_round: int = 1,
+        dynamic_knn_coord_dim: int = 8,
+        dynamic_knn_refresh_edge: bool = True,
     ):
         super().__init__()
         self.mode = mode
@@ -117,6 +127,20 @@ class TrackPreFilter(nn.Module):
         # PNA multi-aggregation (Corso et al., NeurIPS 2020):
         # 'max' = standard max-pool, 'pna' = cat([mean, max, min, std])
         self.aggregation_mode = aggregation_mode
+
+        # Dynamic kNN state. coord_projection is built lazily below (after
+        # hidden_dim is known). When dynamic_knn=False, no submodule is
+        # registered → state-dict parity with the P1 baseline.
+        self.dynamic_knn_enabled = bool(dynamic_knn)
+        self.dynamic_knn_start_round = int(dynamic_knn_start_round)
+        self.dynamic_knn_coord_dim = int(dynamic_knn_coord_dim)
+        self.dynamic_knn_refresh_edge = bool(dynamic_knn_refresh_edge)
+        # Test/diagnostic hook. Set ``_record_dynamic_info = True`` before
+        # a forward pass to populate ``_last_dynamic_info`` with per-round
+        # coords, neighbor indices, and edge-feature tensors. Default OFF
+        # to keep the production forward allocation-free.
+        self._record_dynamic_info: bool = False
+        self._last_dynamic_info: dict | None = None
 
         # Pairwise LV edge features on k-NN edges (ParT-style).
         # When True, each message round appends max-pooled pairwise_lv_fts
@@ -301,6 +325,43 @@ class TrackPreFilter(nn.Module):
                 ])
             else:
                 self.soft_attention_aggregators = None
+
+            # --- Dynamic kNN coord projection (DGCNN/ParticleNet-style) ---
+            # Projects the evolving per-track embedding (B, H, P) into a
+            # learned low-dimensional coordinate space (B, d_coord, P). The
+            # kNN graph is then rebuilt via plain L2 distance in that space
+            # between message-passing rounds. When dynamic_knn=False, no
+            # submodule is registered → state-dict parity with the P1
+            # baseline. BN keeps coord stats stable across the batch; the
+            # bias-free Conv1d preserves zero invariance for masked tracks.
+            #
+            # topk() is non-differentiable, so using the coords only for
+            # kNN indices leaves coord_projection with no gradient. The
+            # coord_to_hidden residual gives coord_projection a gradient
+            # path: learned coords are back-projected to hidden_dim and
+            # added to ``current`` after each rebuild, so the projection
+            # trains via the downstream neighbor_mlp + scorer — matching
+            # DGCNN's convention where the features used for kNN are the
+            # same features that flow through EdgeConv.
+            if self.dynamic_knn_enabled:
+                self.coord_projection = nn.Sequential(
+                    nn.Conv1d(
+                        hidden_dim,
+                        self.dynamic_knn_coord_dim,
+                        kernel_size=1,
+                        bias=False,
+                    ),
+                    nn.BatchNorm1d(self.dynamic_knn_coord_dim),
+                )
+                self.coord_to_hidden = nn.Conv1d(
+                    self.dynamic_knn_coord_dim,
+                    hidden_dim,
+                    kernel_size=1,
+                    bias=False,
+                )
+            else:
+                self.coord_projection = None
+                self.coord_to_hidden = None
 
             # --- Scoring head ---
             # Dropout goes after the middle ReLU only. The final
@@ -615,7 +676,10 @@ class TrackPreFilter(nn.Module):
                 track_embedding, mask,
             ) * mask_float
 
-        # kNN indices in (eta, phi), computed once and reused across rounds
+        # Initial static kNN in (eta, phi). When dynamic kNN is active
+        # for round 0 (start_round == 0), these indices are immediately
+        # replaced below — but the first call is still needed to seed
+        # the diagnostics path and the edge-feature pipeline.
         with torch.no_grad():
             neighbor_indices = cross_set_knn(
                 query_coordinates=points,
@@ -625,55 +689,63 @@ class TrackPreFilter(nn.Module):
                 query_reference_indices=None,
             )
 
-        # Edge features — computed once per forward since only dependent
-        # on the kNN graph + Lorentz vectors, not on the evolving
-        # embedding. For max-pool: reduced to (B, 4, P). For
-        # soft-attention (P4): keep the per-neighbour (B, 4, P, K)
-        # tensor as an edge-feature input to the score MLP.
-        if self.use_edge_features:
-            if self.soft_attention_aggregators is not None:
-                # P4 path: keep the per-neighbour (B, 4, P, K) tensor
-                # as an input to the attention score MLP, and also
-                # max-pool it once so the downstream neighbor_mlp
-                # concat retains its E2a input shape.
-                edge_features_per_neighbor, edge_neighbor_validity = (
-                    self._compute_edge_features_per_neighbor(
-                        lorentz_vectors, mask_float, neighbor_indices,
-                    )
-                )
-                edge_for_max = edge_features_per_neighbor.masked_fill(
-                    edge_neighbor_validity == 0, float('-inf'),
-                )
-                edge_max_pooled = edge_for_max.max(dim=-1)[0]
-                edge_max_pooled = torch.where(
-                    torch.isfinite(edge_max_pooled),
-                    edge_max_pooled,
-                    torch.zeros_like(edge_max_pooled),
-                )
-            else:
-                edge_features_per_neighbor = None
-                edge_max_pooled = self._compute_edge_max_pooled(
-                    lorentz_vectors, mask_float, neighbor_indices,
-                )
-        else:
-            edge_features_per_neighbor = None
-            edge_max_pooled = None
-
-        # Neighbour validity is derived from the forward-invariant mask
-        # and the forward-invariant k-NN indices, so it's the same for
-        # every message-passing round. Gather it ONCE before the loop
-        # — previously the gather (and its scatter_add_ backward at
-        # ~14.5% CUDA per profile) fired every round redundantly.
+        edge_features_per_neighbor, edge_max_pooled = self._build_edge_tensors(
+            lorentz_vectors, mask_float, neighbor_indices,
+        )
         neighbor_validity = cross_set_gather(mask_float, neighbor_indices)
-        # Pre-compute the validity == 0 boolean mask (also round-
-        # invariant) — the max-pool and soft-attention paths both
-        # need it, and building it once instead of per-round eliminates
-        # a (B, 1, P, K) elementwise_kernel per round.
         neighbor_invalid = neighbor_validity == 0
+
+        # Dynamic-kNN diagnostic collection (tests + training probes).
+        # Disabled by default — flipping ``self._record_dynamic_info``
+        # to True before a forward pass populates ``_last_dynamic_info``
+        # with per-round indices / coords / edges.
+        record = self._record_dynamic_info
+        diag_neighbor_indices: list = []
+        diag_edge_max: list = []
+        diag_coords: dict = {}
+        diag_active_rounds: list = []
+
+        # Pre-round-0 rebuild: if start_round <= 0, the first round
+        # should use learned coords, not (eta, phi). We project the
+        # *track_embedding* (encoder output pre-message-passing) to seed
+        # the initial graph. For start_round >= 1 this branch is skipped
+        # and round 0 runs on the static (eta, phi) graph — the DGCNN
+        # warm-start recipe.
+        if (
+            self.coord_projection is not None
+            and self.dynamic_knn_start_round <= 0
+        ):
+            (
+                neighbor_indices,
+                neighbor_validity,
+                neighbor_invalid,
+                edge_features_per_neighbor,
+                edge_max_pooled,
+                coords,
+                coord_residual,
+            ) = self._dynamic_knn_rebuild(
+                track_embedding,
+                mask,
+                mask_float,
+                lorentz_vectors,
+                edge_features_per_neighbor,
+                edge_max_pooled,
+            )
+            # Residual add so coord_projection receives gradient through
+            # the downstream neighbor_mlp + scorer (topk is non-diff).
+            track_embedding = track_embedding + coord_residual
+            if record:
+                diag_coords[0] = coords.detach()
+                diag_active_rounds.append(0)
 
         # Multi-round message passing
         current = track_embedding
         for round_index in range(self.num_message_rounds):
+            if record:
+                diag_neighbor_indices.append(neighbor_indices.detach())
+                if edge_max_pooled is not None:
+                    diag_edge_max.append(edge_max_pooled.detach())
+
             neighbor_features = cross_set_gather(
                 current, neighbor_indices,
             )
@@ -723,6 +795,45 @@ class TrackPreFilter(nn.Module):
 
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
+            # Dynamic kNN rebuild for the NEXT round. Gated on:
+            #   coord_projection is registered (dynamic_knn_enabled)
+            #   next_round exists (round_index + 1 < R)
+            #   next_round >= start_round
+            next_round = round_index + 1
+            if (
+                self.coord_projection is not None
+                and next_round < self.num_message_rounds
+                and next_round >= self.dynamic_knn_start_round
+            ):
+                (
+                    neighbor_indices,
+                    neighbor_validity,
+                    neighbor_invalid,
+                    edge_features_per_neighbor,
+                    edge_max_pooled,
+                    coords,
+                    coord_residual,
+                ) = self._dynamic_knn_rebuild(
+                    current,
+                    mask,
+                    mask_float,
+                    lorentz_vectors,
+                    edge_features_per_neighbor,
+                    edge_max_pooled,
+                )
+                current = current + coord_residual
+                if record:
+                    diag_coords[next_round] = coords.detach()
+                    diag_active_rounds.append(next_round)
+
+        if record:
+            self._last_dynamic_info = {
+                'neighbor_indices_per_round': diag_neighbor_indices,
+                'coords_per_round': diag_coords,
+                'edge_max_pooled_per_round': diag_edge_max or None,
+                'dynamic_rounds_active': diag_active_rounds,
+            }
+
         # Cache the final per-track embedding for downstream loss heads
         # (OC, MPM reconstruction). Small overhead; only read when the
         # corresponding loss_type is active.
@@ -749,6 +860,125 @@ class TrackPreFilter(nn.Module):
         # Default scoring head
         scores = self.scorer(current).squeeze(1)  # (B, P)
         return scores
+
+    def _build_edge_tensors(
+        self,
+        lorentz_vectors: torch.Tensor,
+        mask_float: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute the (optional) edge tensors for the current graph.
+
+        Returns ``(edge_features_per_neighbor, edge_max_pooled)``. The
+        per-neighbour tensor is only populated when the soft-attention
+        aggregator is active (it consumes it directly as an edge input to
+        its score MLP). The max-pooled tensor has shape ``(B, 4, P)`` and
+        is concatenated into each round's neighbor-MLP input.
+
+        Factored out of ``_forward_mlp`` so that the dynamic-kNN rebuild
+        can refresh edge features on the new neighbor set without
+        duplicating the soft-attention pre-pool logic.
+        """
+        if not self.use_edge_features:
+            return None, None
+        if self.soft_attention_aggregators is not None:
+            edge_features_per_neighbor, edge_neighbor_validity = (
+                self._compute_edge_features_per_neighbor(
+                    lorentz_vectors, mask_float, neighbor_indices,
+                )
+            )
+            edge_for_max = edge_features_per_neighbor.masked_fill(
+                edge_neighbor_validity == 0, float('-inf'),
+            )
+            edge_max_pooled = edge_for_max.max(dim=-1)[0]
+            edge_max_pooled = torch.where(
+                torch.isfinite(edge_max_pooled),
+                edge_max_pooled,
+                torch.zeros_like(edge_max_pooled),
+            )
+            return edge_features_per_neighbor, edge_max_pooled
+        edge_max_pooled = self._compute_edge_max_pooled(
+            lorentz_vectors, mask_float, neighbor_indices,
+        )
+        return None, edge_max_pooled
+
+    def _dynamic_knn_rebuild(
+        self,
+        embedding: torch.Tensor,
+        mask: torch.Tensor,
+        mask_float: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
+        edge_features_per_neighbor: torch.Tensor | None,
+        edge_max_pooled: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,           # neighbor_indices (B, P, K)
+        torch.Tensor,           # neighbor_validity (B, 1, P, K)
+        torch.Tensor,           # neighbor_invalid  (B, 1, P, K) bool
+        torch.Tensor | None,    # edge_features_per_neighbor (B, 4, P, K) | None
+        torch.Tensor | None,    # edge_max_pooled (B, 4, P) | None
+        torch.Tensor,           # coords (B, d_coord, P) — diagnostics
+        torch.Tensor,           # coord_residual (B, H, P) — added to current
+    ]:
+        """DGCNN-style rebuild. L2 kNN on unit-normalized learned coords.
+
+        Math (per pair (m, p) between query m and reference p):
+            coords_m = normalize( CoordProjection(embedding_m) )
+            d_mp² = ||coords_m − coords_p||² = 2 − 2·⟨coords_m, coords_p⟩
+            N_m = top-K_p { d_mp² | mask_p }
+
+        Autocast-disabled projection matches the recipe used for
+        ``pairwise_lv_fts`` (bf16 norm underflow on small activations
+        would zero out the unit-normalization). The resulting unit-sphere
+        coords give cosine-distance kNN semantics, which is well-
+        conditioned for gradient flow through subsequent rounds.
+
+        Returns a back-projected ``coord_residual`` so the caller can add
+        it to the running ``current`` embedding — that gives coord
+        projection a differentiable path (topk is non-differentiable).
+        """
+        from weaver.nn.model.HierarchicalGraphBackbone import (
+            euclidean_cross_set_knn,
+        )
+
+        with torch.amp.autocast('cuda', enabled=False):
+            coords = self.coord_projection(embedding.float())
+            coord_norm = coords.norm(dim=1, keepdim=True)
+            coords = coords / (coord_norm + 1e-6)
+
+        with torch.no_grad():
+            neighbor_indices = euclidean_cross_set_knn(
+                query_coordinates=coords,
+                reference_coordinates=coords,
+                num_neighbors=self.num_neighbors,
+                reference_mask=mask,
+            )
+
+        neighbor_validity = cross_set_gather(mask_float, neighbor_indices)
+        neighbor_invalid = neighbor_validity == 0
+
+        if self.use_edge_features and self.dynamic_knn_refresh_edge:
+            edge_features_per_neighbor, edge_max_pooled = self._build_edge_tensors(
+                lorentz_vectors, mask_float, neighbor_indices,
+            )
+        # else: keep the incoming tensors unchanged (stale but kept for
+        # ablation / refresh_edge=False comparisons).
+
+        # Back-project coords into the hidden dim for the residual update.
+        # ``embedding.dtype`` preserves the autocast precision that the
+        # caller expects (bf16 / fp32) for the subsequent concat + MLP.
+        coord_residual = self.coord_to_hidden(
+            coords.to(embedding.dtype),
+        ) * mask_float
+
+        return (
+            neighbor_indices,
+            neighbor_validity,
+            neighbor_invalid,
+            edge_features_per_neighbor,
+            edge_max_pooled,
+            coords,
+            coord_residual,
+        )
 
     def _compute_edge_max_pooled(
         self,

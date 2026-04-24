@@ -197,6 +197,53 @@ def cross_set_knn(
     return neighbor_indices
 
 
+def euclidean_cross_set_knn(
+    query_coordinates: torch.Tensor,
+    reference_coordinates: torch.Tensor,
+    num_neighbors: int,
+    reference_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Cross-set k-Nearest Neighbors with plain L2 distance (no phi wrap).
+
+    Drop-in sibling of ``cross_set_knn`` for arbitrary-dimensional coordinate
+    spaces. Used by TrackPreFilter's dynamic kNN rebuild, which projects the
+    per-track embedding into a learned d_coord-dimensional space — phi
+    wrapping is meaningless there.
+
+    Formula (squared L2 expansion):
+        ||q_m − r_p||² = ||q_m||² + ||r_p||² − 2·⟨q_m, r_p⟩
+
+    Args:
+        query_coordinates: (B, d, M) query points.
+        reference_coordinates: (B, d, P) reference points.
+        num_neighbors: K — neighbors per query.
+        reference_mask: (B, 1, P) boolean mask, True for valid reference
+            points. Invalid references get distance = +∞ and never win top-K.
+
+    Returns:
+        neighbor_indices: (B, M, K) indices into the P dimension, dtype=long.
+    """
+    # Inner product (B, M, P)
+    inner_product = torch.matmul(
+        query_coordinates.transpose(-1, -2), reference_coordinates,
+    )
+    # Norm-squared contributions broadcast to (B, M, P).
+    query_norm_squared = query_coordinates.pow(2).sum(dim=1).unsqueeze(-1)
+    reference_norm_squared = reference_coordinates.pow(2).sum(dim=1).unsqueeze(-2)
+    distances = (
+        query_norm_squared + reference_norm_squared - 2.0 * inner_product
+    ).clamp(min=0)
+
+    if reference_mask is not None:
+        invalid = ~reference_mask.bool()  # (B, 1, P)
+        distances = distances.masked_fill(invalid, float('inf'))
+
+    neighbor_indices = distances.topk(
+        k=num_neighbors, dim=-1, largest=False, sorted=False,
+    )[1]  # (B, M, K)
+    return neighbor_indices
+
+
 def cross_set_gather(
     reference_features: torch.Tensor,
     neighbor_indices: torch.Tensor,

@@ -702,6 +702,38 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         '--soft-attention-bottleneck', type=int, default=64,
         help='P4 score-MLP bottleneck width.',
     )
+    # --- Dynamic kNN (DGCNN/ParticleNet-style graph rebuild) ---
+    parser.add_argument(
+        '--dynamic-knn', action='store_true',
+        help='D. Rebuild the neighbor graph between message-passing '
+             'rounds by projecting the evolving per-track embedding to a '
+             'learned low-dimensional coordinate space. Round 0 uses the '
+             'static (eta, phi) graph by default; rounds >= start_round '
+             'use learned coords.',
+    )
+    parser.add_argument(
+        '--dynamic-knn-start-round', type=int, default=1,
+        help='D. First round that uses the learned-coord kNN. '
+             '0 = fully dynamic (no spatial warm-start). 1 = DGCNN-style '
+             'warm-start (default).',
+    )
+    parser.add_argument(
+        '--dynamic-knn-coord-dim', type=int, default=8,
+        help='D. Dim of the learned coord projection. 8 = DGCNN-lite; '
+             'raise to 16 for richer coord space at ~4x distance-matrix '
+             'memory cost.',
+    )
+    parser.add_argument(
+        '--dynamic-knn-refresh-edge', action='store_true', default=True,
+        help='D. Recompute Lorentz edge features on the rebuilt neighbor '
+             'set (default). Disable with --no-dynamic-knn-refresh-edge '
+             'to keep the initial static-kNN edge features throughout.',
+    )
+    parser.add_argument(
+        '--no-dynamic-knn-refresh-edge',
+        dest='dynamic_knn_refresh_edge', action='store_false',
+        help='See --dynamic-knn-refresh-edge.',
+    )
     # --- Two-tier prefilter (P6) — only read by
     #     networks/lowpt_tau_TwoTierPreFilter.py wrapper.
     parser.add_argument(
@@ -944,6 +976,10 @@ def main():
         film_context_dim=args.film_context_dim,
         use_soft_attention_aggregation=args.soft_attention_aggregation,
         soft_attention_bottleneck=args.soft_attention_bottleneck,
+        dynamic_knn=args.dynamic_knn,
+        dynamic_knn_start_round=args.dynamic_knn_start_round,
+        dynamic_knn_coord_dim=args.dynamic_knn_coord_dim,
+        dynamic_knn_refresh_edge=args.dynamic_knn_refresh_edge,
         # Two-tier-only kwargs — ignored by the single-tier wrapper
         # (see `networks/lowpt_tau_TrackPreFilter.py`) and consumed by
         # `networks/lowpt_tau_TwoTierPreFilter.py`.
