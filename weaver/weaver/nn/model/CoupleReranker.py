@@ -80,12 +80,12 @@ class ResidualBlock(nn.Module):
         self.conv_1 = nn.Conv1d(
             hidden_dim, hidden_dim, kernel_size=1, bias=False,
         )
-        self.batchnorm_1 = NanSafeBatchNorm1d(hidden_dim)
+        self.batchnorm_1 = NanSafeBatchNorm1d(hidden_dim, track_running_stats=False)
         self.dropout = nn.Dropout(dropout)
         self.conv_2 = nn.Conv1d(
             hidden_dim, hidden_dim, kernel_size=1, bias=False,
         )
-        self.batchnorm_2 = NanSafeBatchNorm1d(hidden_dim)
+        self.batchnorm_2 = NanSafeBatchNorm1d(hidden_dim, track_running_stats=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
@@ -465,7 +465,7 @@ class CoupleReranker(nn.Module):
         # residual blocks and BN-calibration pipeline to stay unchanged.
         self.input_projection = nn.Sequential(
             nn.Conv1d(self.input_dim, hidden_dim, kernel_size=1, bias=False),
-            NanSafeBatchNorm1d(hidden_dim),
+            NanSafeBatchNorm1d(hidden_dim, track_running_stats=False),
             nn.ReLU(inplace=True),
         )
 
@@ -479,7 +479,7 @@ class CoupleReranker(nn.Module):
         intermediate_dim = hidden_dim // 2
         self.scorer = nn.Sequential(
             nn.Conv1d(hidden_dim, intermediate_dim, kernel_size=1, bias=False),
-            NanSafeBatchNorm1d(intermediate_dim),
+            NanSafeBatchNorm1d(intermediate_dim, track_running_stats=False),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Conv1d(intermediate_dim, 1, kernel_size=1),
@@ -515,7 +515,7 @@ class CoupleReranker(nn.Module):
                     hidden_dim, intermediate_dim,
                     kernel_size=1, bias=False,
                 ),
-                NanSafeBatchNorm1d(intermediate_dim),
+                NanSafeBatchNorm1d(intermediate_dim, track_running_stats=False),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.Conv1d(intermediate_dim, 1, kernel_size=1),
