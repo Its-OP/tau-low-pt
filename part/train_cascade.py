@@ -279,16 +279,15 @@ def validate(
             )
             points, features, lorentz_vectors, mask = model_inputs
 
-            # model.train() here is only for BatchNorm batch stats (stale
-            # running stats would otherwise crater R@K). Denoising is
-            # force-disabled via the compute_loss kwarg so val/train losses
-            # stay directly comparable.
-            model.train()
+            # Denoising is force-disabled via the compute_loss kwarg so
+            # val/train losses stay directly comparable. Stage 1 BN is
+            # already pinned to batch-statistics mode by CascadeModel via
+            # force_train_bn, so no per-batch train()/eval() toggling is
+            # needed to keep R@K stable.
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
                 use_contrastive_denoising=False,
             )
-            model.eval()
 
             per_track_scores = loss_dict.pop('_scores').detach()
 

@@ -168,6 +168,40 @@ class TestCascadeConstruction:
         model = _make_cascade(top_k1=600)
         assert model.top_k1 == 600
 
+    def test_stage1_bn_stays_on_batch_stats_in_eval(self):
+        """Model-level eval() must leave stage1 BN layers in train mode so
+        batch statistics are used instead of the stale running stats that
+        would drop R@600 from 0.90 to 0.70.
+        """
+        model = _make_cascade()
+        model.eval()
+        stage1_bn_layers = [
+            m for m in model.stage1.modules()
+            if isinstance(m, nn.BatchNorm1d)
+        ]
+        assert stage1_bn_layers, 'stage1 has no BatchNorm layers to check'
+        for batch_norm in stage1_bn_layers:
+            assert batch_norm.training is True
+
+    def test_stage1_bn_stays_on_batch_stats_in_train(self):
+        model = _make_cascade()
+        model.train()
+        for m in model.stage1.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                assert m.training is True
+
+    def test_stage2_follows_outer_mode(self):
+        """Stage 2 has no BN, so its submodules should track the cascade
+        mode normally — eval() puts them into eval, train() into train.
+        """
+        model = _make_cascade()
+        model.eval()
+        for submodule in model.stage2.modules():
+            assert submodule.training is False
+        model.train()
+        for submodule in model.stage2.modules():
+            assert submodule.training is True
+
 
 # ---- Forward pass ----
 
