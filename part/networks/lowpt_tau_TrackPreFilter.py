@@ -1,7 +1,11 @@
 """Network wrapper for TrackPreFilter (Stage 1 of two-stage pipeline).
 
-Default configuration: MLP mode with hidden_dim=256,
-num_message_rounds=2, ranking_num_samples=50.
+Default configuration: MLP mode with hidden_dim=256, k=16,
+num_message_rounds=3, ranking_num_samples=50, edge features ON, and
+P1 per-feature embedding ON (feature_embed_mode='per_feature',
+feature_embed_dim=32) — the winning configuration from the 2026-04-23
+expressiveness sweep (val P@256 = 0.8976 vs 0.8904 for the pre-P1 E2a
+anchor). Pass ``--feature-embed-mode none`` to reproduce the anchor.
 
 Input features (16): px, py, pz, eta, phi, charge, dxy_significance,
 log_dz_significance, normalized_chi2, log_pt_error, n_valid_pixel_hits,
@@ -58,11 +62,12 @@ def get_model(data_config, **kwargs):
         listwise_temperature=kwargs.pop('listwise_temperature', 1.0),
         use_xgb_stub_feature=kwargs.pop('use_xgb_stub_feature', False),
         clustering_dim=kwargs.pop('clustering_dim', 8),
-        # Expressiveness plug-ins (prefilter P@256 sweep). All default off;
-        # enabling any of them diverges the state-dict from the E2a baseline,
-        # so a checkpoint trained with these flags cannot be loaded into a
-        # stock E2a wrapper.
-        feature_embed_mode=kwargs.pop('feature_embed_mode', 'none'),
+        # Expressiveness plug-ins (prefilter P@256 sweep). P1 is the new
+        # baseline as of the 2026-04-23 sweep (P@256 0.8976 vs 0.8904 E2a);
+        # the remaining heads (P2/P3/P4) stayed below P1 and are still off
+        # by default. A checkpoint trained with P1 on diverges from the
+        # pre-P1 E2a state_dict, so a stock E2a wrapper cannot load it.
+        feature_embed_mode=kwargs.pop('feature_embed_mode', 'per_feature'),
         feature_embed_dim=kwargs.pop('feature_embed_dim', 32),
         use_feature_gate=kwargs.pop('use_feature_gate', False),
         feature_gate_bottleneck=kwargs.pop('feature_gate_bottleneck', 16),

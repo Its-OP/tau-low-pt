@@ -124,11 +124,16 @@ declare -A NETWORK_FAMILY=(
     [P6]="two_tier"
 )
 declare -A EXPERIMENT_ARGS=(
-    # Rely on train_prefilter.py + wrapper defaults for the E2a baseline
-    # (edges ON, k=16, r=3, dropout=0.1) — see commit 1363bef. Each
-    # follow-up row lists ONLY what it changes on top of that baseline.
-    [E2a_anchor]=""
-    [P1]="--feature-embed-mode per_feature --feature-embed-dim 32"
+    # Baseline = train_prefilter.py + wrapper defaults: edges ON, k=16,
+    # r=3, dropout=0.1, P1 per-feature embedding ON (per_feature, dim=32)
+    # as of the 2026-04-23 sweep. Each follow-up row lists ONLY what it
+    # changes on top of that baseline.
+    #
+    # E2a_anchor reproduces the pre-P1 baseline by explicitly turning
+    # the per-feature embedding OFF; P1 is now a no-op row kept for
+    # lineage documentation only.
+    [E2a_anchor]="--feature-embed-mode none"
+    [P1]=""
     [P2]="--feature-gate --feature-gate-bottleneck 16"
     [P3]="--film-head --film-context-dim 32"
     [P4]="--soft-attention-aggregation --soft-attention-bottleneck 64"

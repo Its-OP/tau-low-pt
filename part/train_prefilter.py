@@ -662,11 +662,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     # --- Expressiveness plug-in heads (prefilter P@256 sweep) ---
     parser.add_argument(
-        '--feature-embed-mode', type=str, default='none',
+        '--feature-embed-mode', type=str, default='per_feature',
         choices=('none', 'per_feature'),
-        help='P1. "per_feature" routes each raw input channel through '
-             'its own grouped 1×1 Conv + LayerNorm + ReLU before '
-             'track_mlp, producing (16 * feature_embed_dim) channels.',
+        help='P1 (now baseline). "per_feature" routes each raw input '
+             'channel through its own grouped 1×1 Conv + LayerNorm + '
+             'ReLU before track_mlp, producing (16 * feature_embed_dim) '
+             'channels. Pass "none" to reproduce the pre-P1 E2a anchor.',
     )
     parser.add_argument(
         '--feature-embed-dim', type=int, default=32,

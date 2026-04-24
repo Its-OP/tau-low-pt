@@ -341,3 +341,26 @@ config was E2c (edge + k=32 + r=3) at 0.9223. Target C@200 > 0.95 was not
 reached within budget. Infra deliverables: torch.profiler integration,
 `cross_set_gather` rewrite (3 copies → 1, lifted BS=256 k=48 OOM ceiling).
 Full results + autopsy: `reports/prefilter_campaign_20260419_results.md`.
+
+---
+
+### Prefilter expressiveness sweep (2026-04-22 → 2026-04-23)
+
+Target: P@256 > 0.90 (E2a anchor = 0.8904). Five heads run, 40 ep each
+unless noted, BS=256 AMP on two vast.ai Blackwell servers.
+
+| Experiment | Config delta | Val P@256 | vs anchor |
+|---|---|---|---|
+| E2a_anchor | — (k=16, r=3, edges ON, dropout=0.1) | 0.8904 | — |
+| P2 (feature gate) | `--feature-gate` b=16 | 0.8928 | +0.0024 |
+| P3 (FiLM) | `--film-head` ctx=32 | 0.8918 | +0.0014 |
+| P4 (soft-attn pool) | `--soft-attention-aggregation` b=64, BS=64 | 0.8902 | −0.0002 |
+| **P1 (per-feature embed)** | `--feature-embed-mode per_feature --feature-embed-dim 32` | **0.8976** | **+0.0072** |
+| P6 (two-tier) | top-600 → 256, composite-1e6 loss | 0.1174 (ep 14) | dead (loss bug) |
+
+P1 wins by +0.0072 absolute, short of the 0.90 target by 0.0024. A
+60-ep rerun of P1 was killed at ep 50/60 after a 25-ep plateau
+(best 0.8955 at ep 25, worse than the 40-ep 0.8976). P1 promoted to
+baseline: wrapper + CLI defaults flipped; the cascade-reranker loader
+auto-detects the `feature_embedder.*` module so any downstream Stage 2
+training can load P1-on checkpoints transparently.
