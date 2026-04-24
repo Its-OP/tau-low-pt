@@ -1,13 +1,14 @@
 """Evaluate a trained TrackPreFilter checkpoint on the full validation set.
 
 Loads the checkpoint, infers the model config from the state dict,
-applies ``disable_bn_running_stats`` (so BN forwards use batch statistics
-regardless of train/eval mode), switches the model to ``.eval()``, and
-reports R@K / P@K / d' / median rank over the full val loop.
+switches the model to ``.eval()``, and reports R@K / P@K / d' / median
+rank over the full val loop.
 
-This is the canonical post-BN-fix evaluation path — confirms that
-``disable_bn_running_stats`` restores the training-time R@K metrics
-when the model is run in ``.eval()`` (no Dropout active).
+Stage-1 BatchNorm is constructed with ``track_running_stats=False`` (see
+``weaver/weaver/nn/model/TrackPreFilter.py``), so BN uses per-batch
+statistics in both train and eval mode. Old checkpoints whose state
+dict still carries ``running_mean`` / ``running_var`` / ``num_batches_tracked``
+keys are loaded with ``strict=False`` — those keys are dropped silently.
 
 Usage:
     python -m diagnostics.eval_prefilter_full_val \\
@@ -15,9 +16,6 @@ Usage:
         --data-config data/low-pt/lowpt_tau_trackfinder.yaml \\
         --data-dir data/low-pt/val/ \\
         --batch-size 64 --device cuda:0
-
-Pass ``--no-disable-bn`` to skip the BN fix and reproduce the stale-
-running-stats behaviour for comparison.
 """
 from __future__ import annotations
 
@@ -33,7 +31,6 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from weaver.nn.model.stateless_bn import disable_bn_running_stats
 from weaver.nn.model.TrackPreFilter import TrackPreFilter
 from weaver.utils.dataset import SimpleIterDataset
 
@@ -69,10 +66,6 @@ def _parse_arguments():
         '--stage1-num-neighbors', type=int, default=16,
         help='kNN k at inference (not recoverable from state dict).',
     )
-    parser.add_argument(
-        '--no-disable-bn', action='store_true',
-        help='Skip disable_bn_running_stats — reproduces the stale-BN bug.',
-    )
     return parser.parse_args()
 
 
@@ -87,7 +80,10 @@ def _build_model(checkpoint_path, data_config, stage1_num_neighbors):
     )
     inferred['input_dim'] = len(data_config.input_dicts['pf_features'])
     model = TrackPreFilter(**inferred)
-    model.load_state_dict(state_dict)
+    # strict=False: older checkpoints carry running_mean / running_var /
+    # num_batches_tracked; the model now has track_running_stats=False, so
+    # those keys are unexpected — drop them silently.
+    model.load_state_dict(state_dict, strict=False)
     return model, inferred
 
 
@@ -132,13 +128,6 @@ def main():
         'Parameters: %d', sum(p.numel() for p in model.parameters()),
     )
 
-    if args.no_disable_bn:
-        logger.info(
-            'BN running-stats NOT disabled — expect stale-stat behaviour.',
-        )
-    else:
-        disable_bn_running_stats(model)
-        logger.info('disable_bn_running_stats applied to all BN submodules.')
     model.eval()
 
     metrics_accumulator = MetricsAccumulator(

@@ -165,7 +165,7 @@ class TrackPreFilter(nn.Module):
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
-            self.lorentz_norm = nn.BatchNorm1d(4)
+            self.lorentz_norm = nn.BatchNorm1d(4, track_running_stats=False)
 
         # GAPLayer MIA for attention-weighted neighbor aggregation
         if use_gap_attention:
@@ -218,14 +218,14 @@ class TrackPreFilter(nn.Module):
                 nn.Conv1d(
                     track_mlp_input_dim, hidden_dim, kernel_size=1, bias=False,
                 ),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
             ]
             if use_dropout:
                 track_mlp_layers.append(nn.Dropout(p=dropout))
             track_mlp_layers += [
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
             ]
             if use_dropout:
@@ -248,7 +248,7 @@ class TrackPreFilter(nn.Module):
                     nn.Conv1d(
                         neighbor_input_dim, hidden_dim, kernel_size=1, bias=False,
                     ),
-                    nn.BatchNorm1d(hidden_dim),
+                    nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                     nn.ReLU(),
                 ]
                 if use_dropout:
@@ -311,7 +311,7 @@ class TrackPreFilter(nn.Module):
             # new run is training from scratch anyway.
             scorer_layers: list[nn.Module] = [
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
             ]
             if use_dropout:
@@ -350,7 +350,7 @@ class TrackPreFilter(nn.Module):
                         input_dim + 1, hidden_dim,
                         kernel_size=1, bias=False,
                     ),
-                    nn.BatchNorm1d(hidden_dim),
+                    nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                     nn.ReLU(),
                 ]
                 if use_dropout:
@@ -359,7 +359,7 @@ class TrackPreFilter(nn.Module):
                     nn.Conv1d(
                         hidden_dim, hidden_dim, kernel_size=1, bias=False,
                     ),
-                    nn.BatchNorm1d(hidden_dim),
+                    nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                     nn.ReLU(),
                 ]
                 if use_dropout:
@@ -372,10 +372,10 @@ class TrackPreFilter(nn.Module):
             # Track tower
             self.track_tower = nn.Sequential(
                 nn.Conv1d(input_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, embedding_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(embedding_dim),
+                nn.BatchNorm1d(embedding_dim, track_running_stats=False),
             )
             # Learned tau prototypes (multiple for multi-prototype mode)
             self.tau_prototypes = nn.Parameter(
@@ -386,16 +386,16 @@ class TrackPreFilter(nn.Module):
             # Encoder
             self.encoder = nn.Sequential(
                 nn.Conv1d(input_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, latent_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(latent_dim),
+                nn.BatchNorm1d(latent_dim, track_running_stats=False),
                 nn.ReLU(),
             )
             # Decoder
             self.decoder = nn.Sequential(
                 nn.Conv1d(latent_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, input_dim, kernel_size=1),
             )
@@ -404,15 +404,15 @@ class TrackPreFilter(nn.Module):
             ae_input_dim = input_dim + (4 if use_lorentz_vectors else 0)
             self.encoder = nn.Sequential(
                 nn.Conv1d(ae_input_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, latent_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(latent_dim),
+                nn.BatchNorm1d(latent_dim, track_running_stats=False),
                 nn.ReLU(),
             )
             self.decoder = nn.Sequential(
                 nn.Conv1d(latent_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, ae_input_dim, kernel_size=1),
             )
@@ -421,10 +421,10 @@ class TrackPreFilter(nn.Module):
             hybrid_input_dim = ae_input_dim + latent_dim + 1
             self.track_mlp = nn.Sequential(
                 nn.Conv1d(hybrid_input_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
             )
             # Neighbor aggregation — repeated for each message round
@@ -444,7 +444,7 @@ class TrackPreFilter(nn.Module):
                 self.neighbor_mlps = nn.ModuleList([
                     nn.Sequential(
                         nn.Conv1d(2 * hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                        nn.BatchNorm1d(hidden_dim),
+                        nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                         nn.ReLU(),
                     )
                     for _ in range(num_message_rounds)
@@ -454,14 +454,14 @@ class TrackPreFilter(nn.Module):
                 self.neighbor_mlps = nn.ModuleList([
                     nn.Sequential(
                         nn.Conv1d(neighbor_input_dim, hidden_dim, kernel_size=1, bias=False),
-                        nn.BatchNorm1d(hidden_dim),
+                        nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                         nn.ReLU(),
                     )
                     for _ in range(num_message_rounds)
                 ])
             self.scorer = nn.Sequential(
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, 1, kernel_size=1),
             )

@@ -103,7 +103,11 @@ def load_prefilter_from_checkpoint(
         ranking_num_samples=50,
     )
 
-    model.load_state_dict(state_dict)
+    # strict=False: pre-stateless-BN checkpoints carry running_mean /
+    # running_var / num_batches_tracked buffers; the current TrackPreFilter
+    # has track_running_stats=False on every BN, so those keys are
+    # unexpected and dropped.
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model.eval()
 
